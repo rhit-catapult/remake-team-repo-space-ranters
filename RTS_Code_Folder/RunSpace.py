@@ -2,32 +2,30 @@ import pygame
 import sys
 import random
 import time
+import RTSunits
 
 def main():
-    # turn on pygame
     pygame.init()
-
-    # create a screen
     pygame.display.set_caption("Cool Project")
-    # TODO: Change the size of the screen as you see fit!
     screen = pygame.display.set_mode((640, 480), pygame.RESIZABLE)
-
-    # let's set the framerate
     clock = pygame.time.Clock()
+    
+    # ships: 
+
     while True:
         clock.tick(60)  # this sets the framerate of your game
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 sys.exit()
 
-            # TODO: Add you events code
+            # TODO: keyboard events here:
 
-        # TODO: Fill the screen with whatever background color you like!
         screen.fill((255, 255, 255))
 
-        # TODO: Add your project code
+        # TODO: project code:
 
-        # don't forget the update, otherwise nothing will show up!
+        # update screen:
+        clock.tick(60)
         pygame.display.update()
 
 
