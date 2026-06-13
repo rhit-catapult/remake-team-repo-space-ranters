@@ -2,8 +2,10 @@ import pygame
 import sys
 import random
 import time
-import RTSunits
 import math
+
+import RTSunits
+import RTSmap
 
 def main():
     pygame.init()
@@ -12,7 +14,9 @@ def main():
     clock = pygame.time.Clock()
     
     # ships: 
-    ship1 = RTSunits.Frigate(screen, 200, 200)
+    ship1 = RTSunits.Frigate(screen, 200, 200, 1)
+
+    # control vars:
     forward_speed = 0
     strafe_speed = 0
     angle = 0

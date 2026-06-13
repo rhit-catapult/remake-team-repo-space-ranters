@@ -5,9 +5,10 @@ import time
 import math
 
 class Frigate:
-    def __init__(self, screen, x, y):
+    def __init__(self, screen, x, y, size):
         self.screen = screen
         self.image = pygame.image.load("RTS_Code_Folder\\Friget_V1.png").convert_alpha()
+        self.image = pygame.transform.scale(self.image, (50 * size, 60 * size))
         self.x, self.y = x, y
         self.angle = 0
 
