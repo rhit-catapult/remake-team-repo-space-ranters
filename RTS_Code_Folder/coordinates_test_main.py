@@ -1,0 +1,233 @@
+"""
+main.py — Demonstrates a world-coordinate system with a camera viewport.
+
+This script builds a large world surface, creates a player and AI agents,
+and renders only the portion of the world that is visible through the camera.
+The camera can either follow a chosen entity or be panned manually with the
+right mouse button.
+
+World size:  3200 × 2400  (much larger than the screen)
+Screen size:  960 × 640
+
+Controls:
+  WASD / Arrow keys  — move the player
+  F                  — toggle camera: follow player vs. free pan
+  Tab                — cycle camera focus (player / AI character 1 / AI character 2)
+  Mouse drag (RMB)   — pan the camera freely
+  Escape             — quit
+"""
+
+import sys
+import pygame
+from coordinates_test_camera import Camera
+from coordinates_test_entity import Player, AICharacter
+
+# Screen size in pixels: this is the visible display window.
+SCREEN_W, SCREEN_H = 960, 640
+
+# World size in world-space units: this is larger than the screen so the camera
+# must move to reveal different parts of the environment.
+WORLD_W, WORLD_H   = 3200, 2400
+
+# Tile size used to draw the grid background on the world surface.
+TILE               = 64
+
+# Target frame rate for the main loop.
+FPS                = 60
+
+# Colours used for the world background, grid lines, and HUD overlays.
+BG_DARK  = (18, 22, 30)
+GRID_COL = (30, 36, 48)
+HUD_BG   = (0, 0, 0, 160)
+
+
+# ── World background ───────────────────────────────────────────────────────────
+def build_world_surface() -> pygame.Surface:
+    """Pre-render the static world background once.
+
+    The entire world is drawn to a single off-screen surface. During each frame,
+    only the camera's visible rectangle is blitted from this surface to the
+    display surface, which saves CPU and simplifies coordinate handling.
+    """
+    surf = pygame.Surface((WORLD_W, WORLD_H))
+    surf.fill(BG_DARK)  # Fill the full world area with a dark background color.
+
+    # Grid lines: draw vertical and horizontal lines at fixed TILE intervals.
+    for gx in range(0, WORLD_W, TILE):
+        pygame.draw.line(surf, GRID_COL, (gx, 0), (gx, WORLD_H))
+    for gy in range(0, WORLD_H, TILE):
+        pygame.draw.line(surf, GRID_COL, (0, gy), (WORLD_W, gy))
+
+    # Landmark rectangles scattered around the world to help visualize the map.
+    landmarks = [
+        ((400,  300), (200, 150), (60, 100, 80),  "Town Square"),
+        ((1500, 800), (180, 120), (90, 60,  60),  "Red Keep"),
+        ((2600, 400), (240, 100), (50, 80,  120), "Lake"),
+        ((800,  1600),(160, 160), (100,80,  40),  "Forest Camp"),
+        ((2200, 1800),(200, 140), (80, 50,  90),  "Dark Tower"),
+    ]
+
+    font = pygame.font.SysFont("monospace", 18, bold=True)
+
+    # Draw each landmark with a background rectangle, border, and text label.
+    for (lx, ly), (lw, lh), col, label in landmarks:
+        pygame.draw.rect(surf, col, (lx, ly, lw, lh), border_radius=8)
+        pygame.draw.rect(surf, (255, 255, 255), (lx, ly, lw, lh), 2, border_radius=8)
+        txt = font.render(label, True, (220, 220, 220))
+        surf.blit(txt, (lx + 6, ly + lh + 4))
+
+    return surf
+
+
+# ── HUD overlay ───────────────────────────────────────────────────────────────
+def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
+             follow_mode: bool, focus_idx: int, fps: float):
+    """Render the heads-up display and minimap over the main game view."""
+    font_sm = pygame.font.SysFont("monospace", 14)
+
+    # Lines of text that show current performance and control hints.
+    lines = [
+        f"FPS: {fps:.0f}",
+        f"Camera world pos: ({camera.x:.0f}, {camera.y:.0f})",
+        f"Follow mode: {'ON' if follow_mode else 'OFF (RMB drag)'}",
+        f"Focus: {['Player', 'AI-1', 'AI-2'][focus_idx]}",
+        "",
+        "WASD/Arrows = move player",
+        "F = toggle follow   Tab = cycle focus",
+        "RMB drag = free pan",
+    ]
+
+    # Create a transparent HUD panel and draw each line of text.
+    hud = pygame.Surface((260, len(lines) * 18 + 12), pygame.SRCALPHA)
+    hud.fill((0, 0, 0, 150))
+    for i, line in enumerate(lines):
+        colour = (180, 220, 255) if i < 4 else (140, 140, 140)
+        hud.blit(font_sm.render(line, True, colour), (8, 6 + i * 18))
+    screen.blit(hud, (8, 8))
+
+    # Minimap overlay shows the full world in miniature and highlights the
+    # current camera viewport and entity positions.
+    mm_w, mm_h = 160, 100
+    mm_x, mm_y = SCREEN_W - mm_w - 10, 10
+    mm = pygame.Surface((mm_w, mm_h), pygame.SRCALPHA)
+    mm.fill((0, 0, 0, 160))
+    pygame.draw.rect(mm, (60, 60, 80), (0, 0, mm_w, mm_h), 1)
+
+    def to_mm(wx, wy):
+        # Convert world coordinates into minimap coordinates by scaling.
+        return (int(wx / WORLD_W * mm_w), int(wy / WORLD_H * mm_h))
+
+    # Draw the camera viewport rectangle onto the minimap.
+    vp_x, vp_y = to_mm(camera.x, camera.y)
+    vp_w = int(camera.screen_width / WORLD_W * mm_w)
+    vp_h = int(camera.screen_height / WORLD_H * mm_h)
+    pygame.draw.rect(mm, (80, 80, 120), (vp_x, vp_y, vp_w, vp_h))
+    pygame.draw.rect(mm, (160, 160, 200), (vp_x, vp_y, vp_w, vp_h), 1)
+
+    # Draw dots for each entity's world position on the minimap.
+    colours = [(80, 180, 255), (255, 140, 60), (255, 200, 60)]
+    for ent, col in zip(entities, colours):
+        mx, my = to_mm(ent.wx, ent.wy)
+        pygame.draw.circle(mm, col, (mx, my), 3)
+
+    screen.blit(mm, (mm_x, mm_y))
+    font_sm2 = pygame.font.SysFont("monospace", 11)
+    screen.blit(font_sm2.render("MINIMAP", True, (140, 140, 160)), (mm_x + 4, mm_y + mm_h + 2))
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main():
+    """Initialize the game, create objects, and run the main update/draw loop."""
+    pygame.init()  # Initialize all imported pygame modules.
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    pygame.display.set_caption("World Coordinate System Demo")
+    clock = pygame.time.Clock()  # Clock to manage timing and FPS.
+
+    world_surf = build_world_surface()  # Create the static world image once.
+    camera = Camera(SCREEN_W, SCREEN_H)  # Camera manages viewport position.
+
+    player = Player(400 + 100, 300 + 80)  # Player start position in world space.
+
+    # Two AI characters, each with its own route of world-space waypoints.
+    ai1 = AICharacter(1500, 800, [
+        (1500, 800), (2600, 400), (2200, 1800), (800, 1600), (400, 300),
+    ])
+    ai2 = AICharacter(2200, 1800, [
+        (2200, 1800), (400, 300), (1500, 800), (800, 1600), (2600, 400),
+    ])
+
+    entities = [player, ai1, ai2]  # All world entities updated and drawn each frame.
+
+    follow_mode = True  # Whether the camera should track the selected focus entity.
+    focus_idx   = 0     # Index of the current camera focus: 0=player, 1=ai1, 2=ai2.
+    dragging    = False  # Whether the right mouse button is currently dragging.
+    drag_origin = (0, 0)  # Last mouse position used for dragging calculations.
+
+    camera.follow(player.wx, player.wy)  # Snap camera to the player's start position.
+
+    while True:
+        dt = clock.tick(FPS) / 1000.0  # Delta time in seconds, used for consistent motion.
+
+        # ── Events ─────────────────────────────────────────────────────
+        # Handle all user input and window events before updating game state.
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+                if event.key == pygame.K_f:
+                    follow_mode = not follow_mode  # Toggle automatic camera following.
+                if event.key == pygame.K_TAB:
+                    focus_idx = (focus_idx + 1) % len(entities)  # Cycle camera focus.
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                dragging = True
+                drag_origin = event.pos  # Start dragging from the current mouse pos.
+
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                dragging = False  # Stop panning when the right mouse button is released.
+
+            if event.type == pygame.MOUSEMOTION and dragging:
+                dx = drag_origin[0] - event.pos[0]
+                dy = drag_origin[1] - event.pos[1]
+                camera.move(dx, dy)  # Move the camera opposite to mouse motion.
+                drag_origin = event.pos
+                follow_mode = False  # Break follow mode when user manually pans.
+
+        # ── Update ─────────────────────────────────────────────────────
+        for ent in entities:
+            ent.update(dt)  # Update each entity's logic using the elapsed time.
+
+        # Keep the player inside the limits of the world.
+        player.wx = max(0, min(player.wx, WORLD_W - player.width))
+        player.wy = max(0, min(player.wy, WORLD_H - player.height))
+
+        # If camera follow is enabled, smoothly move the camera toward the focus entity.
+        if follow_mode:
+            focus = entities[focus_idx]
+            camera.follow(
+                focus.wx + focus.width  / 2,
+                focus.wy + focus.height / 2,
+                lerp=0.08,   # Smooth interpolation factor; smaller values are slower.
+            )
+        camera.clamp(WORLD_W, WORLD_H)  # Prevent camera from leaving the world.
+
+        # ── Draw ───────────────────────────────────────────────────────
+        # Draw the portion of the world surface that corresponds to the camera view.
+        viewport_rect = pygame.Rect(int(camera.x), int(camera.y), SCREEN_W, SCREEN_H)
+        screen.blit(world_surf, (0, 0), viewport_rect)
+
+        # Draw all entities on the screen using the camera for coordinate translation.
+        for ent in entities:
+            ent.draw(screen, camera)
+
+        # Draw HUD and minimap overlays after world and entity rendering.
+        draw_hud(screen, camera, entities, follow_mode, focus_idx, clock.get_fps())
+
+        pygame.display.flip()  # Present the rendered frame to the display.
+
+
+if __name__ == "__main__":
+    main()
