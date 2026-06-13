@@ -16,10 +16,21 @@ class Frigate:
         rotated_rect = rotated.get_rect(center=(self.x, self.y))
         self.screen.blit(rotated, rotated_rect)
 
-    def move(self, speed, angle):
+    def move(self, forward_speed, strafe_speed, angle):
         self.angle = angle
-        dx = speed * math.cos((angle + 90) * math.pi / 180)
-        dy = -speed * math.sin((angle + 90) * math.pi / 180)
+        # Forward/backward motion along the ship's facing direction
+        dx = forward_speed * math.cos((angle + 90) * math.pi / 180)
+        dy = -forward_speed * math.sin((angle + 90) * math.pi / 180)
+        # Strafing motion perpendicular to facing direction
+        dx += strafe_speed * math.cos(angle * math.pi / 180)
+        dy += -strafe_speed * math.sin(angle * math.pi / 180)
         self.x += dx
         self.y += dy
+
+    def get_front_position(self):
+        # approximate front of the ship at a distance of half the image height
+        offset = self.image.get_height() / 2
+        front_x = self.x + offset * math.cos((self.angle + 90) * math.pi / 180)
+        front_y = self.y - offset * math.sin((self.angle + 90) * math.pi / 180)
+        return front_x, front_y
     
