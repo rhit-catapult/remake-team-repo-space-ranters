@@ -89,7 +89,7 @@ def build_world_surface() -> pygame.Surface:
     
     # Tile the background image across the entire world
     import os
-    image_path = os.path.join(os.path.dirname(__file__), "RTS Background.png")
+    image_path = os.path.join(os.path.dirname(__file__), "RTS Background 2.png")
     tile_image_across_world(surf, image_path, WORLD_W, WORLD_H)
     
     return surf
