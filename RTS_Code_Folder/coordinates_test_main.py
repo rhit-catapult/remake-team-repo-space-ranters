@@ -23,59 +23,75 @@ from coordinates_test_camera import Camera
 from coordinates_test_entity import Player, AICharacter
 
 # Screen size in pixels: this is the visible display window.
-SCREEN_W, SCREEN_H = 960, 640
+SCREEN_W, SCREEN_H = 1000, 800
 
 # World size in world-space units: this is larger than the screen so the camera
 # must move to reveal different parts of the environment.
-WORLD_W, WORLD_H   = 3200, 2400
+WORLD_W, WORLD_H   = 4000, 3200
 
-# Tile size used to draw the grid background on the world surface.
-TILE               = 64
 
 # Target frame rate for the main loop.
 FPS                = 60
 
-# Colours used for the world background, grid lines, and HUD overlays.
-BG_DARK  = (18, 22, 30)
-GRID_COL = (30, 36, 48)
+# Colours used for the world background, and HUD overlays.
+BG_DARK  = (0, 0, 0)
 HUD_BG   = (0, 0, 0, 160)
 
 
 # ── World background ───────────────────────────────────────────────────────────
+def tile_image_across_world(surf: pygame.Surface, image_path: str, world_width: int, 
+                            world_height: int) -> None:
+    """Tile an image across the entire world surface at its native resolution.
+    
+    Args:
+        surf: The world surface to tile onto.
+        image_path: Path to the image file to tile.
+        world_width: Width of the world in pixels.
+        world_height: Height of the world in pixels.
+    
+    The image is tiled at its original size without scaling. If the image is larger
+    than a single tile position, it will extend beyond that position (but only the
+    viewport rectangle is visible, so this is handled correctly).
+    """
+    try:
+        # Load the tile image at its native resolution (no scaling)
+        tile_image = pygame.image.load(image_path)
+        tile_w, tile_h = tile_image.get_size()
+        
+        # Calculate how many tiles we need in each direction
+        tiles_x = (world_width + tile_w - 1) // tile_w  # Ceiling division
+        tiles_y = (world_height + tile_h - 1) // tile_h
+        
+        # Tile the image across the entire world
+        for y in range(tiles_y):
+            for x in range(tiles_x):
+                tile_x = x * tile_w
+                tile_y = y * tile_h
+                surf.blit(tile_image, (tile_x, tile_y))
+    except pygame.error as e:
+        print(f"Warning: Could not load tile image '{image_path}': {e}")
+        # Fall back to dark background if image fails to load
+        surf.fill(BG_DARK)
+
+
 def build_world_surface() -> pygame.Surface:
     """Pre-render the static world background once.
 
     The entire world is drawn to a single off-screen surface. During each frame,
     only the camera's visible rectangle is blitted from this surface to the
     display surface, which saves CPU and simplifies coordinate handling.
+    
+    The background is tiled from the RTS Background.png image at its native resolution,
+    automatically accounting for variable screen and world sizes.
     """
     surf = pygame.Surface((WORLD_W, WORLD_H))
-    surf.fill(BG_DARK)  # Fill the full world area with a dark background color.
-
-    # Grid lines: draw vertical and horizontal lines at fixed TILE intervals.
-    for gx in range(0, WORLD_W, TILE):
-        pygame.draw.line(surf, GRID_COL, (gx, 0), (gx, WORLD_H))
-    for gy in range(0, WORLD_H, TILE):
-        pygame.draw.line(surf, GRID_COL, (0, gy), (WORLD_W, gy))
-
-    # Landmark rectangles scattered around the world to help visualize the map.
-    landmarks = [
-        ((400,  300), (200, 150), (60, 100, 80),  "Town Square"),
-        ((1500, 800), (180, 120), (90, 60,  60),  "Red Keep"),
-        ((2600, 400), (240, 100), (50, 80,  120), "Lake"),
-        ((800,  1600),(160, 160), (100,80,  40),  "Forest Camp"),
-        ((2200, 1800),(200, 140), (80, 50,  90),  "Dark Tower"),
-    ]
-
-    font = pygame.font.SysFont("monospace", 18, bold=True)
-
-    # Draw each landmark with a background rectangle, border, and text label.
-    for (lx, ly), (lw, lh), col, label in landmarks:
-        pygame.draw.rect(surf, col, (lx, ly, lw, lh), border_radius=8)
-        pygame.draw.rect(surf, (255, 255, 255), (lx, ly, lw, lh), 2, border_radius=8)
-        txt = font.render(label, True, (220, 220, 220))
-        surf.blit(txt, (lx + 6, ly + lh + 4))
-
+    surf.fill(BG_DARK)  # Fill with dark background as fallback.
+    
+    # Tile the background image across the entire world
+    import os
+    image_path = os.path.join(os.path.dirname(__file__), "RTS Background.png")
+    tile_image_across_world(surf, image_path, WORLD_W, WORLD_H)
+    
     return surf
 
 
