@@ -21,7 +21,7 @@ import sys
 import random
 import pygame
 from camera import Camera
-from entities import Player, AICharacter
+from entities import Player, AICharacter, Bullet
 
 # Screen size in pixels: this is the visible display window.
 SCREEN_W, SCREEN_H = 1000, 800
@@ -145,12 +145,18 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
     pygame.draw.rect(mm, (80, 80, 120), (vp_x, vp_y, vp_w, vp_h))
     pygame.draw.rect(mm, (160, 160, 200), (vp_x, vp_y, vp_w, vp_h), 1)
 
-    # Draw dots for each entity's world position on the minimap.
-    # Player is blue; all AI characters are orange.
+    # Draw dots for each entity on the minimap: player = white, teams = blue/red.
     for i, ent in enumerate(entities):
-        col = (80, 180, 255) if i == 0 else (255, 140, 60)
+        if i == 0:
+            col = (255, 255, 255)
+        elif hasattr(ent, 'alive') and not ent.alive:
+            continue
+        elif hasattr(ent, 'team'):
+            col = (80, 140, 255) if ent.team == 0 else (255, 60, 60)
+        else:
+            col = (180, 180, 180)
         mx, my = to_mm(ent.wx, ent.wy)
-        pygame.draw.circle(mm, col, (mx, my), 3)
+        pygame.draw.circle(mm, col, (mx, my), 2)
 
     screen.blit(mm, (mm_x, mm_y))
     font_sm2 = pygame.font.SysFont("monospace", 11)
@@ -170,14 +176,17 @@ def main():
 
     player = Player(400 + 100, 300 + 80)  # Player start position in world space.
 
-    # Generate AI characters at random world positions with random waypoints.
+    # Generate AI characters split evenly into two teams.
     ai_characters = []
-    for _ in range(NUM_AI):
+    for i in range(NUM_AI):
+        team = 0 if i < NUM_AI // 2 else 1
         waypoints = [
             (random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
             for _ in range(5)
         ]
-        ai_characters.append(AICharacter(waypoints[0][0], waypoints[0][1], waypoints))
+        ai_characters.append(AICharacter(waypoints[0][0], waypoints[0][1], waypoints, team=team))
+
+    bullets: list[Bullet] = []
 
     entities = [player] + ai_characters  # All world entities updated and drawn each frame.
 
@@ -221,11 +230,31 @@ def main():
 
         # ── Update ─────────────────────────────────────────────────────
         for ent in entities:
-            ent.update(dt)  # Update each entity's logic using the elapsed time.
+            ent.update(dt)
 
         # Keep the player inside the limits of the world.
         player.wx = max(0, min(player.wx, WORLD_W - player.width))
         player.wy = max(0, min(player.wy, WORLD_H - player.height))
+
+        # Turret combat: find targets and fire.
+        for ship in ai_characters:
+            ship.update_combat(dt, ai_characters, bullets)
+
+        # Move bullets and check hits.
+        spent = set()
+        for b in bullets:
+            b.update(dt)
+            if not b.alive:
+                spent.add(id(b))
+                continue
+            for ship in ai_characters:
+                if not ship.alive or ship.team == b.team:
+                    continue
+                if b.world_rect.colliderect(ship.world_rect):
+                    ship.take_damage(Bullet.DAMAGE)
+                    spent.add(id(b))
+                    break
+        bullets[:] = [b for b in bullets if id(b) not in spent]
 
         # If camera follow is enabled, smoothly move the camera toward the focus entity.
         if follow_mode:
@@ -245,6 +274,10 @@ def main():
         # Draw all entities on the screen using the camera for coordinate translation.
         for ent in entities:
             ent.draw(screen, camera)
+
+        # Draw bullets on top of ships.
+        for b in bullets:
+            b.draw(screen, camera)
 
         # Draw HUD and minimap overlays after world and entity rendering.
         draw_hud(screen, camera, entities, follow_mode, focus_idx, clock.get_fps())
