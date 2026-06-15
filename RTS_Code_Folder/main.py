@@ -19,19 +19,20 @@ Controls:
 
 import sys
 import pygame
-from coordinates_test_camera import Camera
-from coordinates_test_entity import Player, AICharacter
+from camera import Camera
+from entities import Player, AICharacter
 
 # Screen size in pixels: this is the visible display window.
 SCREEN_W, SCREEN_H = 1000, 800
 
 # World size in world-space units: this is larger than the screen so the camera
 # must move to reveal different parts of the environment.
-WORLD_W, WORLD_H   = 4000, 3200
 
+map_scale_factor = 4
+WORLD_W, WORLD_H  = 4000 * map_scale_factor, 3200 * map_scale_factor
 
 # Target frame rate for the main loop.
-FPS                = 60
+FPS = 60
 
 # Colours used for the world background, and HUD overlays.
 BG_DARK  = (0, 0, 0)
