@@ -22,7 +22,7 @@ import math
 import random
 import pygame
 from camera import Camera
-from entities import Player, AICharacter, Laser, Explosion, Fighter, Carrier
+from entities import Player, AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer
 
 # Screen size in pixels: this is the visible display window.
 SCREEN_W, SCREEN_H = 1000, 800
@@ -108,8 +108,14 @@ def build_world_surface() -> pygame.Surface:
 
 # ── HUD overlay ───────────────────────────────────────────────────────────────
 def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
-             follow_mode: bool, focus_idx: int, fps: float):
+             follow_mode: bool, focus_idx: int, fps: float,
+             screen_w: int = None, screen_h: int = None):
     """Render the heads-up display and minimap over the main game view."""
+    if screen_w is None:
+        screen_w = screen.get_width()
+    if screen_h is None:
+        screen_h = screen.get_height()
+
     font_sm = pygame.font.SysFont("monospace", 14)
 
     # Lines of text that show current performance and control hints.
@@ -137,7 +143,7 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
     # Minimap overlay shows the full world in miniature and highlights the
     # current camera viewport and entity positions.
     mm_w, mm_h = 160, 100
-    mm_x, mm_y = SCREEN_W - mm_w - 10, 10
+    mm_x, mm_y = screen_w - mm_w - 10, 10
     mm = pygame.Surface((mm_w, mm_h), pygame.SRCALPHA)
     mm.fill((0, 0, 0, 160))
     pygame.draw.rect(mm, (60, 60, 80), (0, 0, mm_w, mm_h), 1)
@@ -175,7 +181,7 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
 def main():
     """Initialize the game, create objects, and run the main update/draw loop."""
     pygame.init()  # Initialize all imported pygame modules.
-    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.RESIZABLE)
     pygame.display.set_caption("World Coordinate System Demo")
     clock = pygame.time.Clock()  # Clock to manage timing and FPS.
 
@@ -192,6 +198,8 @@ def main():
         return [(random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
                 for _ in range(5)]
 
+    NUM_DESTROYERS_PER_TEAM = 2
+
     ai_characters = []
     for i in range(NUM_AI):
         team = 0 if i < NUM_AI // 2 else 1
@@ -202,6 +210,18 @@ def main():
             ai_characters.append(Carrier(wp[0][0], wp[0][1], wp, team=team))
         else:
             ai_characters.append(AICharacter(wp[0][0], wp[0][1], wp, team=team))
+
+    for team in (0, 1):
+        team_carriers = [s for s in ai_characters if isinstance(s, Carrier) and s.team == team]
+        for i in range(NUM_DESTROYERS_PER_TEAM):
+            wp = _make_waypoints()
+            d = Destroyer(wp[0][0], wp[0][1], wp, team=team)
+            if team_carriers:
+                leader = team_carriers[i % len(team_carriers)]
+                d.fleet_leader     = leader
+                d.fleet_offset     = (0.0, (1 if i % 2 == 0 else -1) * 550.0)
+                d.fleet_stray_dist = 900.0
+            ai_characters.append(d)
 
     # Group ships into fleets centred on each carrier (one fleet per carrier per team).
     # The first ESCORTS_PER_FLEET non-carrier ships per fleet become close escorts —
@@ -343,14 +363,19 @@ def main():
         camera.clamp(WORLD_W, WORLD_H)  # Prevent camera from leaving the world.
 
         # ── Draw ───────────────────────────────────────────────────────
+        # Sync camera dimensions in case the window was resized.
+        screen_w, screen_h = screen.get_size()
+        camera.screen_width  = screen_w
+        camera.screen_height = screen_h
+
         # Draw the world: extract the viewport region in world space then scale to screen.
-        vp_w = max(1, int(SCREEN_W / camera.zoom))
-        vp_h = max(1, int(SCREEN_H / camera.zoom))
+        vp_w = max(1, int(screen_w / camera.zoom))
+        vp_h = max(1, int(screen_h / camera.zoom))
         vp_rect = pygame.Rect(int(camera.x), int(camera.y), vp_w, vp_h)
         vp_rect = vp_rect.clip(world_surf.get_rect())  # stay within world bounds
         if vp_rect.width > 0 and vp_rect.height > 0:
             region = world_surf.subsurface(vp_rect)
-            pygame.transform.scale(region, (SCREEN_W, SCREEN_H), screen)
+            pygame.transform.scale(region, (screen_w, screen_h), screen)
 
         # Draw all entities on the screen using the camera for coordinate translation.
         for ent in entities:
@@ -365,7 +390,7 @@ def main():
             exp.draw(screen, camera)
 
         # Draw HUD and minimap overlays after world and entity rendering.
-        draw_hud(screen, camera, entities, follow_mode, focus_idx, clock.get_fps())
+        draw_hud(screen, camera, entities, follow_mode, focus_idx, clock.get_fps(), screen_w, screen_h)
 
         pygame.display.flip()  # Present the rendered frame to the display.
 

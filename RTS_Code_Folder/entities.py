@@ -107,6 +107,32 @@ class Laser:
         pygame.draw.line(surface, inner, (int(sx1), int(sy1)), (int(sx2), int(sy2)), 1)
 
 
+class DestroyerBeam(Laser):
+    """Massive energy beam fired by the Destroyer's main cannon."""
+
+    DURATION = 0.45   # lingers longer than a regular laser
+
+    _BEAM_OUTER = [(20, 130, 255), (255, 75,  20)]   # wide glow per team
+    _BEAM_INNER = [(160, 220, 255), (255, 195, 130)]  # bright core per team
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive:
+            return
+        sx1, sy1 = camera.world_to_screen(self.x1, self.y1)
+        sx2, sy2 = camera.world_to_screen(self.x2, self.y2)
+        t       = self.lifetime / self.DURATION
+        w_outer = max(4, int(18 * t))
+        w_core  = max(2, int(7  * t))
+        outer   = self._BEAM_OUTER[self.team]
+        inner   = self._BEAM_INNER[self.team]
+        pygame.draw.line(surface, outer,
+                         (int(sx1), int(sy1)), (int(sx2), int(sy2)), w_outer)
+        pygame.draw.line(surface, inner,
+                         (int(sx1), int(sy1)), (int(sx2), int(sy2)), w_core)
+        pygame.draw.line(surface, (255, 255, 255),
+                         (int(sx1), int(sy1)), (int(sx2), int(sy2)), max(1, w_core // 3))
+
+
 class Explosion:
     """Particle burst that plays when a ship is destroyed.
 
@@ -249,26 +275,28 @@ class AICharacter(Entity):
         self.current_wp = 0
         self.vx         = 0.0
         self.vy         = 0.0
-        self.angle      = random.uniform(0, math.tau)
-        self._thrusting = False
+        self.angle               = random.uniform(0, math.tau)
+        self._thrusting          = False
+        self._dampening          = False
+        self._thruster_particles = []   # [wx, wy, vx, vy, age, max_age, r0, kind]
 
         # ── Per-ship stats scaled by size class ───────────────────────────
         if big:
             # Capital ships: slow, tanky, heavy guns, multiple turrets
-            self.max_speed     = random.uniform(55,  85)
-            self.thrust        = random.uniform(50,  70)
+            self.max_speed     = random.uniform(190, 270)
+            self.thrust        = random.uniform(100, 140)
             self.turn_rate     = random.uniform(1.0,  2.0)
             self.fire_rate     = random.uniform(2.5,  4.0)
-            self.bullet_damage = random.randint(20,  38)
+            self.bullet_damage = random.randint(10,  18)
             self.max_hp        = random.randint(80, 140)
             num_turrets        = random.choice([2, 2, 3])
         else:
             # Frigates: agile, fragile, light guns, forward-facing fixed guns
-            self.max_speed     = random.uniform(145, 185)
-            self.thrust        = random.uniform(95,  125)
+            self.max_speed     = random.uniform(480, 620)
+            self.thrust        = random.uniform(190, 250)
             self.turn_rate     = random.uniform(3.0,  4.5)
             self.fire_rate     = random.uniform(0.9,  1.7)
-            self.bullet_damage = random.randint(5,   10)
+            self.bullet_damage = random.randint(3,    5)
             self.max_hp        = random.randint(25,  55)
 
         self.hp    = self.max_hp
@@ -305,6 +333,7 @@ class AICharacter(Entity):
 
         # Tactics
         self.attack_range       = ATTACK_RANGE   # subclasses may shorten this
+        self._detection_range   = ATTACK_RANGE * 1.5  # how far away enemies are noticed
         self.role               = 'flanker' if random.random() < 0.35 else 'attacker'
         self.combat_state       = 'patrol'
         self._current_target    = None
@@ -352,50 +381,51 @@ class AICharacter(Entity):
         dist = math.hypot(dx, dy)
 
         self._thrusting = False
+        self._dampening = False
 
         if self._movement_override is None and dist < self.ARRIVE_DIST:
-            # Patrol mode: advance to next waypoint on arrival
             self.current_wp = (self.current_wp + 1) % len(self.waypoints)
+            desired_vx, desired_vy = 0.0, 0.0
+            self._dampening = True
         elif dist > 2.0:
             target_angle = math.atan2(dy, dx)
-            speed        = math.hypot(self.vx, self.vy)
+            self._turn_toward(target_angle, dt)
 
-            # Shorten braking distance in combat so ships don't drift past their target
             decel = self.DECEL_DIST if self._movement_override is None else self.DECEL_DIST * 0.55
-
-            if dist < decel and speed > 15.0:
-                retro_angle = math.atan2(-self.vy, -self.vx)
-                self._turn_toward(retro_angle, dt)
-                if abs(self._angle_diff(retro_angle, self.angle)) < math.pi / 3:
-                    self.vx += math.cos(self.angle) * self.thrust * dt
-                    self.vy += math.sin(self.angle) * self.thrust * dt
-                    self._thrusting = True
+            if dist < decel:
+                desired_speed = self.max_speed * (dist / decel)
+                self._dampening = True
             else:
-                self._turn_toward(target_angle, dt)
-                aligned = abs(self._angle_diff(target_angle, self.angle)) < math.pi / 3
-                if aligned and speed < self.max_speed:
-                    self.vx += math.cos(self.angle) * self.thrust * dt
-                    self.vy += math.sin(self.angle) * self.thrust * dt
-                    self._thrusting = True
+                desired_speed = self.max_speed
+                self._thrusting = True
 
-        # Apply separation impulse accumulated by update_combat (previous frame)
+            desired_vx = math.cos(target_angle) * desired_speed
+            desired_vy = math.sin(target_angle) * desired_speed
+        else:
+            desired_vx, desired_vy = 0.0, 0.0
+
+        # Smoothly steer velocity toward the desired value — prevents jerking
+        # when targets change or the ship is mid-turn
+        t = min(1.0, 9.0 * dt)
+        self.vx += (desired_vx - self.vx) * t
+        self.vy += (desired_vy - self.vy) * t
+
+        # Apply separation impulse (brief push; velocity resets next frame)
         self.vx += self._sep_ax * dt
         self.vy += self._sep_ay * dt
         self._sep_ax = 0.0
         self._sep_ay = 0.0
 
-        drag = self.DRAG ** dt
-        self.vx *= drag
-        self.vy *= drag
-
+        # Hard cap so separation bursts don't send ships flying
         speed = math.hypot(self.vx, self.vy)
-        if speed > self.max_speed:
-            f = self.max_speed / speed
+        if speed > self.max_speed * 1.4:
+            f = self.max_speed * 1.4 / speed
             self.vx *= f
             self.vy *= f
 
         self.wx += self.vx * dt
         self.wy += self.vy * dt
+        self._emit_particles(dt)
 
     # ── Combat & tactics ──────────────────────────────────────────────────────
 
@@ -444,12 +474,19 @@ class AICharacter(Entity):
             ex = ship.wx + ship.width  / 2
             ey = ship.wy + ship.height / 2
             d  = math.hypot(ex - cx, ey - cy)
-            if d > ATTACK_RANGE * 1.5:   # extended detection range so ships close in
+            if d > self._detection_range:
                 continue
             # Lower score = more desirable: closer enemies preferred but penalise
             # targets already being attacked by many allies
             ally_count = target_counts.get(id(ship), 0)
             score = d + ally_count * 260
+            # If the fleet leader needs protection, prioritise threats near it
+            if (self.fleet_leader is not None and self.fleet_leader is not self
+                    and self.fleet_leader.alive
+                    and getattr(self.fleet_leader, '_needs_defense', False)):
+                lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
+                lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
+                score -= max(0.0, (1000.0 - math.hypot(ex - lcx, ey - lcy)) * 0.8)
             if score < best_score:
                 best_score  = score
                 best_target = ship
@@ -605,7 +642,7 @@ class AICharacter(Entity):
 
                     if turret['cooldown'] <= 0 and abs(diff) < 0.20:
                         turret['cooldown'] = self.fire_rate
-                        best_target.take_damage(self.bullet_damage)
+                        best_target.try_take_damage(self.bullet_damage)
                         lasers.append(Laser(twx, twy, tx, ty, self.team))
                 else:
                     turret['cooldown'] = max(0.0, turret['cooldown'])
@@ -632,11 +669,98 @@ class AICharacter(Entity):
 
     # ── Shared helpers ────────────────────────────────────────────────────────
 
+    @property
+    def hit_chance(self) -> float:
+        """Probability an incoming shot hits this ship; scales with hull width."""
+        return min(0.92, max(0.22, self.width / 175.0))
+
     def take_damage(self, amount: int) -> None:
         self.hp -= amount
         if self.hp <= 0:
             self.hp    = 0
             self.alive = False
+
+    def try_take_damage(self, amount: int) -> bool:
+        """Roll hit chance before applying damage. Returns True if the shot hit."""
+        if random.random() < self.hit_chance:
+            self.take_damage(amount)
+            return True
+        return False
+
+    def _emit_particles(self, dt: float) -> None:
+        """Age existing particles and spawn new ones for thrust / dampeners."""
+        alive = []
+        for p in self._thruster_particles:
+            p[4] += dt
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            if p[4] < p[5]:
+                alive.append(p)
+        self._thruster_particles = alive
+
+        cx = self.wx + self.width  / 2
+        cy = self.wy + self.height / 2
+
+        sp = math.hypot(self.vx, self.vy)
+
+        if self._thrusting and sp > 5.0:
+            # Exhaust streams opposite to the velocity vector (retrograde)
+            retro_x = -self.vx / sp
+            retro_y = -self.vy / sp
+            for _ in range(2):
+                ang   = math.atan2(retro_y, retro_x) + random.gauss(0, 0.28)
+                spd   = random.uniform(sp * 0.40, sp * 0.95)
+                max_a = random.uniform(0.15, 0.32)
+                r0    = self.height * random.uniform(0.10, 0.30)
+                self._thruster_particles.append([
+                    cx + retro_x * self.width * 0.44,
+                    cy + retro_y * self.width * 0.44,
+                    math.cos(ang) * spd,
+                    math.sin(ang) * spd,
+                    0.0, max_a, r0, 0,
+                ])
+
+        if self._dampening and sp > 5.0:
+            # Bow and side thrusters fire in the direction of motion to brake
+            fwd_ang  = math.atan2(self.vy, self.vx)
+            perp_ang = fwd_ang + math.pi / 2
+            for sign in (1.0, -1.0):
+                jx    = cx + math.cos(perp_ang) * self.height * 0.50 * sign
+                jy    = cy + math.sin(perp_ang) * self.height * 0.50 * sign
+                spd   = random.uniform(sp * 0.10, sp * 0.35)
+                ang   = fwd_ang + random.gauss(0, 0.20)   # fire forward to brake
+                max_a = random.uniform(0.10, 0.22)
+                r0    = self.height * random.uniform(0.05, 0.15)
+                self._thruster_particles.append([
+                    jx, jy,
+                    math.cos(ang) * spd,
+                    math.sin(ang) * spd,
+                    0.0, max_a, r0, 1,
+                ])
+
+    def _draw_particles(self, surface: pygame.Surface, camera) -> None:
+        """Draw all live thruster / dampener particles under the hull."""
+        sw = camera.screen_width
+        sh = camera.screen_height
+        for p in self._thruster_particles:
+            t = max(0.0, 1.0 - p[4] / p[5])
+            sx, sy = camera.world_to_screen(p[0], p[1])
+            if sx < -20 or sx > sw + 20 or sy < -20 or sy > sh + 20:
+                continue
+            r = max(1, int(p[6] * camera.zoom * t))
+            if p[7] == 0:   # exhaust: white-yellow → orange → dark
+                col = (
+                    min(255, int(220 * t + 35)),
+                    int(150 * t * t),
+                    int(20  * t * t * t),
+                )
+            else:            # dampener: cyan → blue → dark
+                col = (
+                    int(30  * t),
+                    int(140 * t * t),
+                    min(255, int(240 * t + 15)),
+                )
+            pygame.draw.circle(surface, col, (int(sx), int(sy)), r)
 
     def _turn_toward(self, target_angle: float, dt: float) -> None:
         diff = self._angle_diff(target_angle, self.angle)
@@ -678,12 +802,7 @@ class AICharacter(Entity):
             return (lx * cos_a - ly * sin_a + cx,
                     lx * sin_a + ly * cos_a + cy)
 
-        # Engine glow when thrusting — drawn before hull so it appears underneath
-        if self._thrusting:
-            ex_s   = -L * 0.85 * cos_a + cx
-            ey_s   = -L * 0.85 * sin_a + cy
-            glow_r = max(2, int(W * 0.6))
-            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), glow_r)
+        self._draw_particles(surface, camera)
 
         screen_pts = [to_screen(lx, ly) for lx, ly in local_pts]
         pygame.draw.polygon(surface, self.color, screen_pts)
@@ -762,11 +881,11 @@ class Fighter(AICharacter):
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override all stats — fighters are extreme in every direction
-        self.max_speed     = random.uniform(220, 275)
-        self.thrust        = random.uniform(180, 230)
+        self.max_speed     = random.uniform(720, 900)
+        self.thrust        = random.uniform(340, 430)
         self.turn_rate     = random.uniform(5.0, 7.0)
         self.fire_rate     = random.uniform(0.7, 1.2)
-        self.bullet_damage = random.randint(4, 8)
+        self.bullet_damage = random.randint(2, 4)
         self.max_hp        = random.randint(10, 20)
         self.hp            = self.max_hp
         self.color         = _FIGHTER_COLORS[team]
@@ -876,11 +995,7 @@ class Fighter(AICharacter):
             (-L * 0.5,-W * 0.3),
             ( 0.0,   -W    ),   # port wing tip
         ]
-        # Engine glow — drawn before hull so it appears underneath
-        if self._thrusting:
-            ex_s = -L * 0.7 * cos_a + cx
-            ey_s = -L * 0.7 * sin_a + cy
-            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), max(2, int(W * 0.5)))
+        self._draw_particles(surface, camera)
 
         pts = [to_screen(lx, ly) for lx, ly in local_pts]
         pygame.draw.polygon(surface, self.color, pts)
@@ -917,7 +1032,8 @@ class Fighter(AICharacter):
 
 # ── Carrier ───────────────────────────────────────────────────────────────────
 
-_CARRIER_COLORS = [(25, 55, 140), (140, 20, 20)]   # dark navy / dark crimson
+_CARRIER_COLORS    = [(25, 55, 140), (140, 20, 20)]   # dark navy / dark crimson
+_DESTROYER_COLORS  = [(45, 75, 160), (160, 40, 40)]  # steel blue / steel red
 
 class Carrier(AICharacter):
     """
@@ -944,8 +1060,8 @@ class Carrier(AICharacter):
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override stats: slow, tanky, light AA armament
-        self.max_speed     = random.uniform(28, 46)
-        self.thrust        = random.uniform(25, 40)
+        self.max_speed     = random.uniform(100, 155)
+        self.thrust        = random.uniform(50, 80)
         self.turn_rate     = random.uniform(0.4, 0.85)
         self.fire_rate     = random.uniform(0.4, 0.65)   # AA fires rapidly...
         self.bullet_damage = random.randint(2, 4)          # ...but tickles
@@ -968,9 +1084,10 @@ class Carrier(AICharacter):
         ]
 
         # Fighter management
-        self._deploy_timer   = random.uniform(0, self.DEPLOY_INTERVAL * 0.5)
-        self._active_fighters: list  = []   # references tracked for headcount
-        self._spawn_queue:    list  = []    # (wx, wy, team) tuples; processed by main.py
+        self._deploy_timer    = random.uniform(0, self.DEPLOY_INTERVAL * 0.5)
+        self._active_fighters: list = []   # references tracked for headcount
+        self._spawn_queue:    list  = []   # (wx, wy, team) tuples; processed by main.py
+        self._needs_defense   = False      # True when enemies are dangerously close
 
     # ── Combat override ───────────────────────────────────────────────────────
 
@@ -1006,8 +1123,11 @@ class Carrier(AICharacter):
                 nearest_dist  = d
                 nearest_enemy = ship
 
-        # Movement: hang back at a safe distance — never charge the front line
+        # Signal allied ships when the carrier is threatened
         SAFE_DIST = ATTACK_RANGE * 1.8
+        self._needs_defense = (nearest_enemy is not None and nearest_dist < SAFE_DIST)
+
+        # Movement: hang back at a safe distance — never charge the front line
         if nearest_enemy is not None and nearest_dist < SAFE_DIST:
             self.combat_state = 'retreat'
             ex = nearest_enemy.wx + nearest_enemy.width  / 2
@@ -1075,12 +1195,7 @@ class Carrier(AICharacter):
             return (lx * cos_a - ly * sin_a + cx,
                     lx * sin_a + ly * cos_a + cy)
 
-        # Engine glow — drawn before hull so it appears underneath
-        if self._thrusting:
-            ex_s   = -L * 0.90 * cos_a + cx
-            ey_s   = -L * 0.90 * sin_a + cy
-            glow_r = max(3, int(W * 0.55))
-            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), glow_r)
+        self._draw_particles(surface, camera)
 
         # Hull — long rectangular carrier silhouette
         hull_pts = [
@@ -1171,6 +1286,250 @@ class Carrier(AICharacter):
             bar_h  = 5
             bar_x  = int(cx - bar_w // 2)
             bar_y  = int(cy - half_diag - 10)
+            fill_w = int(bar_w * self.hp / self.max_hp)
+            pygame.draw.rect(surface, (120, 0,   0), (bar_x, bar_y, bar_w,  bar_h))
+            pygame.draw.rect(surface, (0,  210, 60), (bar_x, bar_y, fill_w, bar_h))
+            pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
+
+
+# ── Destroyer ─────────────────────────────────────────────────────────────────
+
+class Destroyer(AICharacter):
+    """
+    Heavy warship armed with a single devastating fixed main cannon.
+
+    The weapon charges over CHARGE_TIME seconds while the ship holds its aim
+    on a target — a glowing energy orb grows at the muzzle tip.  When fully
+    charged, it fires a beam thick enough to destroy any capital ship in one
+    hit.  Destroyers must turn their entire hull to aim, making flanking them
+    the primary counter.
+
+    Combat role: anti-capital sniper.  Devastating on a firing line;
+    vulnerable when caught out of position or circled by fast frigates.
+    """
+
+    CHARGE_TIME   = 5.0    # seconds of continuous aim-lock required to fire
+    COOLDOWN_TIME = 3.5    # mandatory cooldown after firing before charge can restart
+    CANNON_RANGE  = 1400.0 # world units — long-range sniper reach
+    CANNON_ARC    = 0.10   # half firing arc in radians (~5.7°)
+    CANNON_DAMAGE = 200    # one-shots any capital ship
+
+    def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
+        w = random.randint(130, 165)
+        h = random.randint(45,  62)
+        super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
+
+        self.max_speed  = random.uniform(220, 310)
+        self.thrust     = random.uniform(110, 150)
+        self.turn_rate  = random.uniform(0.9, 1.5)
+        self.max_hp     = random.randint(120, 200)
+        self.hp         = self.max_hp
+        self.color      = _DESTROYER_COLORS[team]
+        self.role       = 'attacker'
+
+        # No inherited turrets or fixed guns — single custom cannon
+        self.gun_type         = 'destroyer'
+        self.turrets          = []
+        self.fixed_guns       = []
+        self._detection_range = self.CANNON_RANGE * 1.5  # sees much further than standard ships
+
+        self._charge     = 0.0   # charge accumulated (0 → CHARGE_TIME)
+        self._cooldown   = 0.0   # post-fire cooldown countdown
+        self._fire_flash = 0.0   # brief muzzle flash after firing
+
+    @property
+    def _charge_frac(self) -> float:
+        return self._charge / self.CHARGE_TIME
+
+    def take_damage(self, amount: int) -> None:
+        super().take_damage(amount)
+        self._charge = 0.0   # any hit breaks the charge
+
+    def _aim_and_fire(self, dt: float, cx: float, cy: float,
+                      all_ships: list, lasers: list) -> None:
+        self._fire_flash = max(0.0, self._fire_flash - dt)
+        self._cooldown   = max(0.0, self._cooldown   - dt)
+
+        # ── Main cannon — prefers large ships (carriers > capitals > frigates) ──
+        best_score  = float('inf')
+        best_target = None
+        for ship in all_ships:
+            if ship is self or ship.team == self.team or not ship.alive:
+                continue
+            ex = ship.wx + ship.width  / 2
+            ey = ship.wy + ship.height / 2
+            d  = math.hypot(ex - cx, ey - cy)
+            if d > self.CANNON_RANGE:
+                continue
+            # Lower score = higher priority; big ships get a large bonus
+            if isinstance(ship, Carrier):
+                size_bonus = 4000
+            elif ship.width >= 88:
+                size_bonus = 2000
+            else:
+                size_bonus = 0
+            score = d - size_bonus
+            if score < best_score:
+                best_score  = score
+                best_target = ship
+
+        self._has_target = best_target is not None
+
+        if best_target is None or self._cooldown > 0 or self.combat_state == 'retreat':
+            self._charge = max(0.0, self._charge - dt * 0.5)
+        else:
+            tx      = best_target.wx + best_target.width  / 2
+            ty      = best_target.wy + best_target.height / 2
+            desired = math.atan2(ty - cy, tx - cx)
+            in_arc  = abs(self._angle_diff(desired, self.angle)) < self.CANNON_ARC
+
+            if in_arc:
+                self._charge = min(self.CHARGE_TIME, self._charge + dt)
+                if self._charge >= self.CHARGE_TIME:
+                    # ── FIRE ──────────────────────────────────────────────
+                    self._charge     = 0.0
+                    self._cooldown   = self.COOLDOWN_TIME
+                    self._fire_flash = 0.40
+                    best_target.try_take_damage(self.CANNON_DAMAGE)
+                    mx = cx + math.cos(self.angle) * (self.width * 0.625)
+                    my = cy + math.sin(self.angle) * (self.width * 0.625)
+                    lasers.append(DestroyerBeam(mx, my, tx, ty, self.team))
+            else:
+                self._charge = max(0.0, self._charge - dt * 2.5)
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive or not camera.is_visible(self.world_rect):
+            return
+
+        cx, cy = camera.world_to_screen(
+            self.wx + self.width  / 2,
+            self.wy + self.height / 2,
+        )
+        z     = camera.zoom
+        L     = self.width  / 2 * z
+        W     = self.height / 2 * z
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+
+        def to_screen(lx, ly):
+            return (lx * cos_a - ly * sin_a + cx,
+                    lx * sin_a + ly * cos_a + cy)
+
+        self._draw_particles(surface, camera)
+
+        # Hull — sharp, angular destroyer silhouette
+        hull_pts = [
+            ( L,          0.0    ),   # prow tip
+            ( L * 0.60,   W      ),
+            (-L * 0.55,   W * 0.70),
+            (-L,          W * 0.40),
+            (-L,         -W * 0.40),
+            (-L * 0.55,  -W * 0.70),
+            ( L * 0.60,  -W      ),
+        ]
+        screen_pts = [to_screen(lx, ly) for lx, ly in hull_pts]
+        pygame.draw.polygon(surface, self.color, screen_pts)
+        pygame.draw.polygon(surface, (190, 200, 220), screen_pts, 1)
+
+        # Main cannon barrel — long spine along the centreline
+        barrel_base = to_screen(L * 0.10, 0.0)
+        barrel_tip  = to_screen(L * 1.25, 0.0)
+        bw = max(3, int(W * 0.26))
+        pygame.draw.line(surface, (130, 145, 165),
+                         (int(barrel_base[0]), int(barrel_base[1])),
+                         (int(barrel_tip[0]),  int(barrel_tip[1])), bw)
+        # Barrel highlight stripe
+        pygame.draw.line(surface, (190, 200, 215),
+                         (int(barrel_base[0]), int(barrel_base[1])),
+                         (int(barrel_tip[0]),  int(barrel_tip[1])), max(1, bw // 3))
+
+        # Muzzle position in screen space (matches _aim_and_fire world muzzle)
+        muzzle_sx = cx + cos_a * L * 1.25
+        muzzle_sy = cy + sin_a * L * 1.25
+
+        # ── Cooldown heat animation ────────────────────────────────────────
+        if self._cooldown > 0.0:
+            ct = self._cooldown / self.COOLDOWN_TIME   # 1=just fired, 0=ready
+            # Barrel glows orange-red and fades to cool grey
+            heat_r = 255
+            heat_g = int(140 * (1.0 - ct))
+            heat_b = 0
+            heat_col  = (heat_r, heat_g, heat_b)
+            heat_glow = (heat_r // 4, heat_g // 4, 0)
+            glow_w = bw + max(2, int(bw * 1.2 * ct))
+            pygame.draw.line(surface, heat_glow,
+                             (int(barrel_base[0]), int(barrel_base[1])),
+                             (int(barrel_tip[0]),  int(barrel_tip[1])), glow_w)
+            pygame.draw.line(surface, heat_col,
+                             (int(barrel_base[0]), int(barrel_base[1])),
+                             (int(barrel_tip[0]),  int(barrel_tip[1])), bw)
+            # Heat shimmer dot at the breech
+            breech_sx = cx + cos_a * L * 0.10
+            breech_sy = cy + sin_a * L * 0.10
+            pygame.draw.circle(surface, heat_col,
+                               (int(breech_sx), int(breech_sy)), max(2, int(bw * ct)))
+
+        # ── Charging animation ─────────────────────────────────────────────
+        f = self._charge_frac
+        if f > 0.0:
+            # Colour ramp: dark purple-blue → bright cyan-white
+            r_c = int(55  * (1.0 - f))
+            g_c = int(200 * f)
+            b_c = 255
+            charge_col = (r_c, g_c, b_c)
+
+            # Fast pulse when nearly charged (last 20%)
+            pulse = 1.0
+            if f > 0.80:
+                t_ms  = pygame.time.get_ticks()
+                pulse = 0.76 + 0.24 * math.sin(t_ms * 0.027)
+
+            glow_r = max(4, int(W * 1.7 * f * pulse))
+            core_r = max(2, int(W * 0.85 * f * pulse))
+
+            # Dim outer halo
+            pygame.draw.circle(surface, (r_c // 5, g_c // 5, b_c // 5),
+                               (int(muzzle_sx), int(muzzle_sy)), glow_r)
+            # Main charge orb
+            pygame.draw.circle(surface, charge_col,
+                               (int(muzzle_sx), int(muzzle_sy)), core_r)
+            # Bright inner core
+            if core_r > 3:
+                pygame.draw.circle(surface, (210, 240, 255),
+                                   (int(muzzle_sx), int(muzzle_sy)), core_r // 2)
+
+            # Energy rings that appear in the final 18% of charge
+            if f > 0.82:
+                t_ms = pygame.time.get_ticks()
+                for i in range(2):
+                    rr = glow_r + 5 + i * 7 + int(3 * math.sin(t_ms * 0.024 + i * 1.9))
+                    pygame.draw.circle(surface, (r_c // 3, g_c // 3, b_c // 3),
+                                       (int(muzzle_sx), int(muzzle_sy)), rr, 1)
+
+        # Post-fire muzzle flash
+        if self._fire_flash > 0.0:
+            ft   = self._fire_flash / 0.40
+            fr   = max(5, int(W * 2.4 * ft))
+            fcol = (170, 225, 255) if self.team == 0 else (255, 205, 150)
+            pygame.draw.circle(surface, fcol,
+                               (int(muzzle_sx), int(muzzle_sy)), fr)
+            pygame.draw.circle(surface, (255, 255, 255),
+                               (int(muzzle_sx), int(muzzle_sy)), max(2, fr // 3))
+
+        # Combat-state dot on the hull spine
+        state_color = self._STATE_COLORS.get(self.combat_state, (128, 128, 128))
+        ind_x = int(cx + cos_a * L * 0.45)
+        ind_y = int(cy + sin_a * L * 0.45)
+        pygame.draw.circle(surface, (0, 0, 0),   (ind_x, ind_y), 5)
+        pygame.draw.circle(surface, state_color, (ind_x, ind_y), 4)
+
+        # Health bar
+        if self.hp < self.max_hp:
+            half_diag = math.hypot(L, W)
+            bar_w  = max(25, int(L * 2.3))
+            bar_h  = 4
+            bar_x  = int(cx - bar_w // 2)
+            bar_y  = int(cy - half_diag - 9)
             fill_w = int(bar_w * self.hp / self.max_hp)
             pygame.draw.rect(surface, (120, 0,   0), (bar_x, bar_y, bar_w,  bar_h))
             pygame.draw.rect(surface, (0,  210, 60), (bar_x, bar_y, fill_w, bar_h))
