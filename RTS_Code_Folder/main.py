@@ -18,10 +18,11 @@ Controls:
 """
 
 import sys
+import math
 import random
 import pygame
 from camera import Camera
-from entities import Player, AICharacter, Bullet
+from entities import Player, AICharacter, Laser, Explosion, Fighter, Carrier
 
 # Screen size in pixels: this is the visible display window.
 SCREEN_W, SCREEN_H = 1000, 800
@@ -37,6 +38,11 @@ FPS = 60
 
 # Number of AI characters to spawn on the map. 10000 is the limit before performace starts declining
 NUM_AI = 100
+
+# Zoom limits and scroll step (each mouse-wheel tick multiplies/divides by ZOOM_STEP).
+ZOOM_MIN  = 0.15
+ZOOM_MAX  = 4.0
+ZOOM_STEP = 1.2
 
 # Colours used for the world background, and HUD overlays.
 BG_DARK  = (0, 0, 0)
@@ -110,10 +116,12 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
     lines = [
         f"FPS: {fps:.0f}",
         f"Camera world pos: ({camera.x:.0f}, {camera.y:.0f})",
+        f"Zoom: {camera.zoom:.2f}x",
         f"Follow mode: {'ON' if follow_mode else 'OFF (RMB drag)'}",
         f"Focus: {'Player' if focus_idx == 0 else f'AI-{focus_idx}'}",
         "",
         "WASD/Arrows = move player",
+        "Scroll wheel = zoom in/out",
         "F = toggle follow   Tab = cycle focus",
         "RMB drag = free pan",
     ]
@@ -177,16 +185,55 @@ def main():
     player = Player(400 + 100, 300 + 80)  # Player start position in world space.
 
     # Generate AI characters split evenly into two teams.
+    # Each team gets NUM_CARRIERS_PER_TEAM carriers; the rest are regular ships.
+    NUM_CARRIERS_PER_TEAM = max(1, NUM_AI // 25)
+
+    def _make_waypoints():
+        return [(random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
+                for _ in range(5)]
+
     ai_characters = []
     for i in range(NUM_AI):
         team = 0 if i < NUM_AI // 2 else 1
-        waypoints = [
-            (random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
-            for _ in range(5)
-        ]
-        ai_characters.append(AICharacter(waypoints[0][0], waypoints[0][1], waypoints, team=team))
+        # The first NUM_CARRIERS_PER_TEAM ships on each team are carriers
+        team_slot = i if team == 0 else i - NUM_AI // 2
+        wp = _make_waypoints()
+        if team_slot < NUM_CARRIERS_PER_TEAM:
+            ai_characters.append(Carrier(wp[0][0], wp[0][1], wp, team=team))
+        else:
+            ai_characters.append(AICharacter(wp[0][0], wp[0][1], wp, team=team))
 
-    bullets: list[Bullet] = []
+    # Group ships into fleets centred on each carrier (one fleet per carrier per team).
+    # The first ESCORTS_PER_FLEET non-carrier ships per fleet become close escorts —
+    # tight formation, short leash, always engage directly.  The rest fan out further.
+    ESCORTS_PER_FLEET = 3
+    for team in (0, 1):
+        carriers  = [s for s in ai_characters if isinstance(s, Carrier) and s.team == team]
+        non_carry = [s for s in ai_characters if not isinstance(s, Carrier) and s.team == team]
+        if not carriers:
+            continue
+        for carrier in carriers:
+            carrier.fleet_leader = carrier
+        for i, ship in enumerate(non_carry):
+            leader     = carriers[i % len(carriers)]
+            fleet_slot = i // len(carriers)   # position index within that fleet
+            ship.fleet_leader = leader
+            if fleet_slot < ESCORTS_PER_FLEET:
+                # Close escort: tight ring around the carrier, short leash
+                angle  = fleet_slot * (math.tau / ESCORTS_PER_FLEET)
+                radius = 260
+                ship.fleet_stray_dist = 380
+                ship.role = 'attacker'   # escorts charge; never flank away from the carrier
+            else:
+                # Regular fleet member: loose golden-angle spread
+                slot   = fleet_slot - ESCORTS_PER_FLEET
+                angle  = slot * 2.39996   # golden angle in radians (~137.5°)
+                radius = 300 + (slot % 4) * 130
+                # fleet_stray_dist stays at the default (900)
+            ship.fleet_offset = (math.cos(angle) * radius, math.sin(angle) * radius)
+
+    lasers:     list[Laser]     = []
+    explosions: list[Explosion] = []
 
     entities = [player] + ai_characters  # All world entities updated and drawn each frame.
 
@@ -224,9 +271,18 @@ def main():
             if event.type == pygame.MOUSEMOTION and dragging:
                 dx = drag_origin[0] - event.pos[0]
                 dy = drag_origin[1] - event.pos[1]
-                camera.move(dx, dy)  # Move the camera opposite to mouse motion.
+                # Divide by zoom so one screen-pixel drag = one world-unit pan at any zoom.
+                camera.move(dx / camera.zoom, dy / camera.zoom)
                 drag_origin = event.pos
                 follow_mode = False  # Break follow mode when user manually pans.
+
+            if event.type == pygame.MOUSEWHEEL:
+                mx, my = pygame.mouse.get_pos()
+                if event.y > 0:
+                    new_zoom = min(camera.zoom * ZOOM_STEP, ZOOM_MAX)
+                else:
+                    new_zoom = max(camera.zoom / ZOOM_STEP, ZOOM_MIN)
+                camera.zoom_toward(new_zoom, mx, my)
 
         # ── Update ─────────────────────────────────────────────────────
         for ent in entities:
@@ -236,25 +292,45 @@ def main():
         player.wx = max(0, min(player.wx, WORLD_W - player.width))
         player.wy = max(0, min(player.wy, WORLD_H - player.height))
 
-        # Turret combat: find targets and fire.
+        # Laser combat: fire beams, apply damage instantly, track kills for explosions.
+        alive_before = {id(s): s.alive for s in ai_characters}
         for ship in ai_characters:
-            ship.update_combat(dt, ai_characters, bullets)
+            ship.update_combat(dt, ai_characters, lasers)
+        for ship in ai_characters:
+            if alive_before.get(id(ship)) and not ship.alive:
+                explosions.append(Explosion(
+                    ship.wx + ship.width  / 2,
+                    ship.wy + ship.height / 2,
+                    ship.width, ship.height,
+                ))
 
-        # Move bullets and check hits.
-        spent = set()
-        for b in bullets:
-            b.update(dt)
-            if not b.alive:
-                spent.add(id(b))
-                continue
-            for ship in ai_characters:
-                if not ship.alive or ship.team == b.team:
-                    continue
-                if b.world_rect.colliderect(ship.world_rect):
-                    ship.take_damage(Bullet.DAMAGE)
-                    spent.add(id(b))
-                    break
-        bullets[:] = [b for b in bullets if id(b) not in spent]
+        # Process carrier spawn queues — add new fighters to the game.
+        new_fighters = []
+        for ship in ai_characters:
+            if isinstance(ship, Carrier) and ship._spawn_queue:
+                for fx, fy, fteam in ship._spawn_queue:
+                    wp = [(random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
+                          for _ in range(5)]
+                    fighter = Fighter(fx, fy, wp, fteam, home_carrier=ship)
+                    fighter.fleet_leader = ship
+                    angle = random.uniform(0, math.tau)
+                    fighter.fleet_offset = (math.cos(angle) * 200, math.sin(angle) * 200)
+                    ship._active_fighters.append(fighter)
+                    new_fighters.append(fighter)
+                ship._spawn_queue.clear()
+        if new_fighters:
+            ai_characters.extend(new_fighters)
+            entities.extend(new_fighters)
+
+        # Fade and prune laser visuals (damage was applied at fire time).
+        for laser in lasers:
+            laser.update(dt)
+        lasers[:] = [l for l in lasers if l.alive]
+
+        # Update and prune finished explosions.
+        for exp in explosions:
+            exp.update(dt)
+        explosions[:] = [e for e in explosions if e.alive]
 
         # If camera follow is enabled, smoothly move the camera toward the focus entity.
         if follow_mode:
@@ -267,17 +343,26 @@ def main():
         camera.clamp(WORLD_W, WORLD_H)  # Prevent camera from leaving the world.
 
         # ── Draw ───────────────────────────────────────────────────────
-        # Draw the portion of the world surface that corresponds to the camera view.
-        viewport_rect = pygame.Rect(int(camera.x), int(camera.y), SCREEN_W, SCREEN_H)
-        screen.blit(world_surf, (0, 0), viewport_rect)
+        # Draw the world: extract the viewport region in world space then scale to screen.
+        vp_w = max(1, int(SCREEN_W / camera.zoom))
+        vp_h = max(1, int(SCREEN_H / camera.zoom))
+        vp_rect = pygame.Rect(int(camera.x), int(camera.y), vp_w, vp_h)
+        vp_rect = vp_rect.clip(world_surf.get_rect())  # stay within world bounds
+        if vp_rect.width > 0 and vp_rect.height > 0:
+            region = world_surf.subsurface(vp_rect)
+            pygame.transform.scale(region, (SCREEN_W, SCREEN_H), screen)
 
         # Draw all entities on the screen using the camera for coordinate translation.
         for ent in entities:
             ent.draw(screen, camera)
 
-        # Draw bullets on top of ships.
-        for b in bullets:
-            b.draw(screen, camera)
+        # Draw laser beams on top of ships.
+        for laser in lasers:
+            laser.draw(screen, camera)
+
+        # Draw explosions on top of everything.
+        for exp in explosions:
+            exp.draw(screen, camera)
 
         # Draw HUD and minimap overlays after world and entity rendering.
         draw_hud(screen, camera, entities, follow_mode, focus_idx, clock.get_fps())

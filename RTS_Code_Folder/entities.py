@@ -61,97 +61,262 @@ _TEAM_COLORS = [
     [(255, 60,  60), (255, 100, 80), (200, 40,  40)],   # Team 1 — reds
 ]
 
-# Combat constants shared by all ships
-ATTACK_RANGE     = 600.0   # world units — turret engagement range
-FIRE_RATE        = 2.0     # seconds between shots
+# ── Combat tuning ─────────────────────────────────────────────────────────────
+ATTACK_RANGE     = 600.0   # world units — laser engagement range
+FIRE_RATE        = 2.0     # seconds between shots (lower = faster firing)
 TURRET_TURN_RATE = 3.5     # radians / second — how fast the turret rotates
+FLANK_OFFSET     = 320.0   # perpendicular distance flankers aim for beside an enemy
+RETREAT_HP_RATIO = 0.28    # fraction of max HP at which a ship breaks off and flees
+SEPARATION_DIST  = 160.0   # allied ships push apart when closer than this
+SEPARATION_FORCE = 50.0    # acceleration magnitude for the separation push
+AA_RANGE         = 350.0   # carrier anti-aircraft turret range (shorter than ATTACK_RANGE)
+FIXED_GUN_ARC    = 0.22    # radians — half firing arc for fixed forward guns (~12.6°)
+FLEET_STRAY_DIST = 900.0   # world units — max distance from fleet slot before returning
 
 
-class Bullet:
-    """A projectile fired by a ship turret."""
+class Laser:
+    """Instant-hit beam weapon — purely a visual effect; damage is applied at fire time."""
 
-    SPEED    = 380.0   # world units / second
-    DAMAGE   = 10
-    LIFETIME = 2.2     # seconds (≈ 836 world-unit range)
-    RADIUS   = 3
+    DURATION = 0.10   # seconds the beam remains visible
 
-    _TEAM_COLORS = [(120, 180, 255), (255, 100, 80)]
+    _OUTER = [(40, 100, 255),  (255, 50,  40) ]   # outer glow colour per team
+    _INNER = [(180, 220, 255), (255, 200, 180)]   # bright core colour per team
 
-    def __init__(self, wx: float, wy: float, angle: float, team: int):
-        self.wx       = wx
-        self.wy       = wy
-        self.vx       = math.cos(angle) * self.SPEED
-        self.vy       = math.sin(angle) * self.SPEED
+    def __init__(self, x1: float, y1: float, x2: float, y2: float, team: int):
+        self.x1, self.y1 = x1, y1   # gun world position
+        self.x2, self.y2 = x2, y2   # target world position
         self.team     = team
-        self.lifetime = self.LIFETIME
+        self.lifetime = self.DURATION
         self.alive    = True
 
-    @property
-    def world_rect(self) -> pygame.Rect:
-        r = self.RADIUS
-        return pygame.Rect(int(self.wx) - r, int(self.wy) - r, r * 2, r * 2)
-
-    def update(self, dt: float):
-        self.wx += self.vx * dt
-        self.wy += self.vy * dt
+    def update(self, dt: float) -> None:
         self.lifetime -= dt
         if self.lifetime <= 0:
             self.alive = False
 
     def draw(self, surface: pygame.Surface, camera) -> None:
-        if not camera.is_visible(self.world_rect):
+        if not self.alive:
             return
-        sx, sy = camera.world_to_screen(self.wx, self.wy)
-        color = self._TEAM_COLORS[self.team]
-        pygame.draw.circle(surface, color,         (int(sx), int(sy)), self.RADIUS)
-        pygame.draw.circle(surface, (255, 255, 255), (int(sx), int(sy)), max(1, self.RADIUS - 1))
+        sx1, sy1 = camera.world_to_screen(self.x1, self.y1)
+        sx2, sy2 = camera.world_to_screen(self.x2, self.y2)
+        t       = self.lifetime / self.DURATION   # 1 = fresh, 0 = dying
+        outer   = self._OUTER[self.team]
+        inner   = self._INNER[self.team]
+        w_outer = max(2, int(4 * t))
+        pygame.draw.line(surface, outer, (int(sx1), int(sy1)), (int(sx2), int(sy2)), w_outer)
+        pygame.draw.line(surface, inner, (int(sx1), int(sy1)), (int(sx2), int(sy2)), 1)
+
+
+class Explosion:
+    """Particle burst that plays when a ship is destroyed.
+
+    Each particle is stored as a list:
+      [wx, wy, vx, vy, lifetime, max_lifetime, base_radius]
+    """
+
+    # Fire colour ramp: index 0 = dying (dark), index 4 = fresh (bright)
+    _RAMP = [
+        ( 80,  10,   0),
+        (200,  40,  10),
+        (255, 120,  20),
+        (255, 200,  50),
+        (255, 255, 200),
+    ]
+
+    def __init__(self, wx: float, wy: float, ship_w: int, ship_h: int):
+        self.alive = True
+        size  = math.hypot(ship_w, ship_h)          # diagonal of the dead ship
+        count = max(18, int(size * 0.28))
+        spread = size * 0.35
+
+        # Central flash particle — large, very short-lived
+        self._particles = [[wx, wy, 0.0, 0.0, 0.18, 0.18, size * 0.55]]
+
+        for _ in range(count):
+            angle = random.uniform(0, math.tau)
+            speed = random.uniform(25, size * 1.4)
+            lt    = random.uniform(0.45, 1.7)
+            r     = random.uniform(1.5, max(2.5, size * 0.065))
+            self._particles.append([
+                wx + random.uniform(-spread, spread),
+                wy + random.uniform(-spread, spread),
+                math.cos(angle) * speed,
+                math.sin(angle) * speed,
+                lt, lt, r,
+            ])
+
+    def update(self, dt: float) -> None:
+        drag = 0.55 ** dt       # speed drops to 55% per second
+        any_alive = False
+        for p in self._particles:
+            if p[4] <= 0:
+                continue
+            p[0] += p[2] * dt
+            p[1] += p[3] * dt
+            p[2] *= drag
+            p[3] *= drag
+            p[4] -= dt
+            any_alive = True
+        self.alive = any_alive
+
+    @staticmethod
+    def _color(t: float) -> tuple[int, int, int]:
+        """Map t ∈ [0,1] (0=dying, 1=fresh) to a fire colour."""
+        ramp = Explosion._RAMP
+        t  = max(0.0, min(1.0, t))
+        s  = t * (len(ramp) - 1)
+        i  = min(int(s), len(ramp) - 2)
+        f  = s - i
+        c0, c1 = ramp[i], ramp[i + 1]
+        return (int(c0[0] + (c1[0] - c0[0]) * f),
+                int(c0[1] + (c1[1] - c0[1]) * f),
+                int(c0[2] + (c1[2] - c0[2]) * f))
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        sw = camera.screen_width
+        sh = camera.screen_height
+        for p in self._particles:
+            if p[4] <= 0:
+                continue
+            sx, sy = camera.world_to_screen(p[0], p[1])
+            if sx < -30 or sx > sw + 30 or sy < -30 or sy > sh + 30:
+                continue
+            t = p[4] / p[5]                            # fraction of lifetime remaining
+            r = max(1, int(p[6] * camera.zoom * (0.25 + 0.75 * t)))
+            pygame.draw.circle(surface, self._color(t), (int(sx), int(sy)), r)
 
 
 class AICharacter(Entity):
     """
-    Spaceship AI flying between waypoints with vacuum-inertia physics.
-    Ships belong to a team and fire a turret at the nearest enemy in range.
+    Spaceship AI with team tactics: roles, state machine, target spreading,
+    aim leading, flanking, intercept chasing, retreat, and allied separation.
 
-    Movement phases:
-      Cruise  — turn toward waypoint, thrust forward when aligned.
-      Braking — turn to face retrograde (opposite velocity), thrust to slow down.
+    Roles (assigned at spawn):
+      attacker — charges enemies head-on, cutting off escape with intercept movement.
+      flanker  — circles to a position perpendicular to the enemy's travel direction.
+
+    Combat states:
+      patrol  — no enemy detected; flying between waypoints.
+      engage  — chasing a target using intercept prediction.
+      flank   — moving to a perpendicular attack position beside the target.
+      retreat — HP critical; fleeing away from the nearest enemy.
+
+    Movement phases (used in all states):
+      Cruise  — turn toward destination, thrust when roughly aligned.
+      Braking — face retrograde, thrust to shed speed near the destination.
     """
 
-    TURN_RATE   = 2.5    # radians / second
-    THRUST      = 85.0   # world units / second²
-    MAX_SPEED   = 120.0  # world units / second
-    DRAG        = 0.97   # speed multiplier / second
-    DECEL_DIST  = 250.0  # world units — switch to braking phase
-    ARRIVE_DIST =  40.0  # world units — count waypoint as reached
+    # Fixed physics constants — same for all ships
+    DRAG        = 0.97   # speed multiplier per second
+    DECEL_DIST  = 250.0  # world units — start braking phase
+    ARRIVE_DIST =  40.0  # world units — waypoint counted as reached
+
+    # Visual dot color per combat state shown on the ship nose
+    _STATE_COLORS = {
+        'patrol':  (110, 110, 110),
+        'engage':  (255, 160,  30),
+        'flank':   ( 50, 220,  70),
+        'retreat': (230,  30,  30),
+    }
+
+    # Turret local positions as (lx_frac, ly_frac) — fractions of half-width / half-height.
+    # Applied after rotating by the ship angle, so turrets move with the hull.
+    _TURRET_LAYOUTS = {
+        1: [(  0.00,  0.00)],
+        2: [(  0.25,  0.00), (-0.30,  0.00)],
+        3: [(  0.30,  0.00), (-0.20, -0.45), (-0.20,  0.45)],
+    }
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
-                 team: int = 0):
-        big = random.random() > 0.5
-        if big:
-            w = random.randint(88, 144)
-            h = random.randint(40, 72)
+                 team: int = 0, _w: int = None, _h: int = None):
+        if _w is not None:
+            w, h = _w, _h
+            big  = w >= 88
         else:
-            w = random.randint(48, 80)
-            h = random.randint(24, 40)
+            big = random.random() > 0.5
+            if big:
+                w = random.randint(88, 144)
+                h = random.randint(40, 72)
+            else:
+                w = random.randint(48, 80)
+                h = random.randint(24, 40)
 
         color = random.choice(_TEAM_COLORS[team])
         super().__init__(wx, wy, w, h, color)
 
-        self.team        = team
-        self.waypoints   = waypoints
-        self.current_wp  = 0
-        self.vx          = 0.0
-        self.vy          = 0.0
-        self.angle       = random.uniform(0, math.tau)
-        self._thrusting  = False
+        self.team       = team
+        self.waypoints  = waypoints
+        self.current_wp = 0
+        self.vx         = 0.0
+        self.vy         = 0.0
+        self.angle      = random.uniform(0, math.tau)
+        self._thrusting = False
 
-        # Combat state
-        self.max_hp          = 100 if big else 50
-        self.hp              = self.max_hp
-        self.alive           = True
-        self.turret_angle    = random.uniform(0, math.tau)
-        self._fire_cooldown  = random.uniform(0, FIRE_RATE)  # stagger first shots
-        self._has_target     = False
+        # ── Per-ship stats scaled by size class ───────────────────────────
+        if big:
+            # Capital ships: slow, tanky, heavy guns, multiple turrets
+            self.max_speed     = random.uniform(55,  85)
+            self.thrust        = random.uniform(50,  70)
+            self.turn_rate     = random.uniform(1.0,  2.0)
+            self.fire_rate     = random.uniform(2.5,  4.0)
+            self.bullet_damage = random.randint(20,  38)
+            self.max_hp        = random.randint(80, 140)
+            num_turrets        = random.choice([2, 2, 3])
+        else:
+            # Frigates: agile, fragile, light guns, forward-facing fixed guns
+            self.max_speed     = random.uniform(145, 185)
+            self.thrust        = random.uniform(95,  125)
+            self.turn_rate     = random.uniform(3.0,  4.5)
+            self.fire_rate     = random.uniform(0.9,  1.7)
+            self.bullet_damage = random.randint(5,   10)
+            self.max_hp        = random.randint(25,  55)
+
+        self.hp    = self.max_hp
+        self.alive = True
+        self._has_target = False
+
+        # Build weapon system
+        # Capital ships: multiple rotating turrets only
+        # Frigates:      1 rotating centre turret + 2 fixed forward nose cannons
+        if big:
+            self.gun_type = 'turret'
+            layout = self._TURRET_LAYOUTS[num_turrets]
+            self.turrets = [
+                {
+                    'lx':      lx,
+                    'ly':      ly,
+                    'angle':   random.uniform(0, math.tau),
+                    'cooldown': random.uniform(0, self.fire_rate),
+                }
+                for lx, ly in layout
+            ]
+            self.fixed_guns = []
+        else:
+            self.gun_type = 'both'
+            self.turrets = [{
+                'lx': 0.0, 'ly': 0.0,
+                'angle':    random.uniform(0, math.tau),
+                'cooldown': random.uniform(0, self.fire_rate),
+            }]
+            self.fixed_guns = [
+                {'lx': 0.72, 'ly': -0.28, 'cooldown': random.uniform(0, self.fire_rate)},
+                {'lx': 0.72, 'ly':  0.28, 'cooldown': random.uniform(0, self.fire_rate)},
+            ]
+
+        # Tactics
+        self.attack_range       = ATTACK_RANGE   # subclasses may shorten this
+        self.role               = 'flanker' if random.random() < 0.35 else 'attacker'
+        self.combat_state       = 'patrol'
+        self._current_target    = None
+        self._flank_side        = random.choice([-1, 1])
+        self._movement_override = None
+        self._sep_ax            = 0.0
+        self._sep_ay            = 0.0
+
+        # Fleet assignment — set by main.py after all ships are spawned
+        self.fleet_leader     = None              # reference to the carrier/lead ship of this fleet
+        self.fleet_offset     = (0.0, 0.0)        # formation slot offset from leader centre
+        self.fleet_stray_dist = FLEET_STRAY_DIST  # per-ship leash; escorts get a tighter value
 
     @property
     def target(self) -> tuple[float, float]:
@@ -167,13 +332,20 @@ class AICharacter(Entity):
             int(half_diag * 2),
         )
 
+    # ── Movement ──────────────────────────────────────────────────────────────
+
     def update(self, dt: float):
         if not self.alive:
             return
 
         cx = self.wx + self.width  / 2
         cy = self.wy + self.height / 2
-        tx, ty = self.target
+
+        # Combat overrides the waypoint destination when active
+        if self._movement_override is not None:
+            tx, ty = self._movement_override
+        else:
+            tx, ty = self.target
 
         dx   = tx - cx
         dy   = ty - cy
@@ -181,50 +353,215 @@ class AICharacter(Entity):
 
         self._thrusting = False
 
-        if dist < self.ARRIVE_DIST:
+        if self._movement_override is None and dist < self.ARRIVE_DIST:
+            # Patrol mode: advance to next waypoint on arrival
             self.current_wp = (self.current_wp + 1) % len(self.waypoints)
-        else:
+        elif dist > 2.0:
             target_angle = math.atan2(dy, dx)
             speed        = math.hypot(self.vx, self.vy)
 
-            if dist < self.DECEL_DIST and speed > 15.0:
+            # Shorten braking distance in combat so ships don't drift past their target
+            decel = self.DECEL_DIST if self._movement_override is None else self.DECEL_DIST * 0.55
+
+            if dist < decel and speed > 15.0:
                 retro_angle = math.atan2(-self.vy, -self.vx)
                 self._turn_toward(retro_angle, dt)
                 if abs(self._angle_diff(retro_angle, self.angle)) < math.pi / 3:
-                    self.vx += math.cos(self.angle) * self.THRUST * dt
-                    self.vy += math.sin(self.angle) * self.THRUST * dt
+                    self.vx += math.cos(self.angle) * self.thrust * dt
+                    self.vy += math.sin(self.angle) * self.thrust * dt
                     self._thrusting = True
             else:
                 self._turn_toward(target_angle, dt)
                 aligned = abs(self._angle_diff(target_angle, self.angle)) < math.pi / 3
-                if aligned and speed < self.MAX_SPEED:
-                    self.vx += math.cos(self.angle) * self.THRUST * dt
-                    self.vy += math.sin(self.angle) * self.THRUST * dt
+                if aligned and speed < self.max_speed:
+                    self.vx += math.cos(self.angle) * self.thrust * dt
+                    self.vy += math.sin(self.angle) * self.thrust * dt
                     self._thrusting = True
+
+        # Apply separation impulse accumulated by update_combat (previous frame)
+        self.vx += self._sep_ax * dt
+        self.vy += self._sep_ay * dt
+        self._sep_ax = 0.0
+        self._sep_ay = 0.0
 
         drag = self.DRAG ** dt
         self.vx *= drag
         self.vy *= drag
 
         speed = math.hypot(self.vx, self.vy)
-        if speed > self.MAX_SPEED:
-            f = self.MAX_SPEED / speed
+        if speed > self.max_speed:
+            f = self.max_speed / speed
             self.vx *= f
             self.vy *= f
 
         self.wx += self.vx * dt
         self.wy += self.vy * dt
 
-    def update_combat(self, dt: float, all_ships: list, bullets: list) -> None:
-        """Rotate the turret toward the nearest enemy and fire when aligned."""
+    # ── Combat & tactics ──────────────────────────────────────────────────────
+
+    def update_combat(self, dt: float, all_ships: list, lasers: list) -> None:
+        """Update tactics, movement intent, weapon aim, and firing each frame."""
         if not self.alive:
             return
 
         cx = self.wx + self.width  / 2
         cy = self.wy + self.height / 2
 
-        # Find nearest living enemy in range
-        best_dist   = ATTACK_RANGE
+        # ── Separation: push away from nearby allies ──────────────────────
+        for ship in all_ships:
+            if ship is self or ship.team != self.team or not ship.alive:
+                continue
+            ox = ship.wx + ship.width  / 2
+            oy = ship.wy + ship.height / 2
+            d  = math.hypot(ox - cx, oy - cy)
+            if 0 < d < SEPARATION_DIST:
+                strength = (SEPARATION_DIST - d) / SEPARATION_DIST * SEPARATION_FORCE
+                self._sep_ax += (cx - ox) / d * strength
+                self._sep_ay += (cy - oy) / d * strength
+
+        # ── Retreat: break off when critically damaged ────────────────────
+        if self.hp / self.max_hp < RETREAT_HP_RATIO:
+            self.combat_state       = 'retreat'
+            self._current_target    = None
+            self._movement_override = self._calc_retreat_pos(cx, cy, all_ships)
+            self._aim_and_fire(dt, cx, cy, all_ships, lasers)
+            return
+
+        # ── Target selection with team coordination ───────────────────────
+        # Count how many living allies are currently engaging each enemy so
+        # ships can spread fire across multiple targets instead of pile-driving one.
+        target_counts: dict[int, int] = {}
+        for ship in all_ships:
+            if ship.team == self.team and ship.alive and ship._current_target is not None:
+                tid = id(ship._current_target)
+                target_counts[tid] = target_counts.get(tid, 0) + 1
+
+        best_score  = float('inf')
+        best_target = None
+        for ship in all_ships:
+            if ship is self or ship.team == self.team or not ship.alive:
+                continue
+            ex = ship.wx + ship.width  / 2
+            ey = ship.wy + ship.height / 2
+            d  = math.hypot(ex - cx, ey - cy)
+            if d > ATTACK_RANGE * 1.5:   # extended detection range so ships close in
+                continue
+            # Lower score = more desirable: closer enemies preferred but penalise
+            # targets already being attacked by many allies
+            ally_count = target_counts.get(id(ship), 0)
+            score = d + ally_count * 260
+            if score < best_score:
+                best_score  = score
+                best_target = ship
+
+        self._current_target = best_target
+        self._has_target     = best_target is not None
+
+        if best_target is None:
+            self.combat_state = 'patrol'
+            # Fleet cohesion: hold formation slot instead of wandering random waypoints
+            if (self.fleet_leader is not None and self.fleet_leader is not self
+                    and self.fleet_leader.alive):
+                lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
+                lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
+                self._movement_override = (lcx + self.fleet_offset[0],
+                                           lcy + self.fleet_offset[1])
+            else:
+                if self.fleet_leader is not None and not self.fleet_leader.alive:
+                    self.fleet_leader = None   # leader destroyed — go independent
+                self._movement_override = None
+            return
+
+        # ── Set state and movement destination based on role ──────────────
+        if self.role == 'flanker':
+            self.combat_state       = 'flank'
+            self._movement_override = self._calc_flank_pos(cx, cy, best_target)
+        else:
+            self.combat_state       = 'engage'
+            self._movement_override = self._calc_intercept_pos(cx, cy, best_target)
+
+        # ── Fleet cohesion: pull back if combat has dragged us too far ────
+        if (self.fleet_leader is not None and self.fleet_leader is not self
+                and self.fleet_leader.alive):
+            lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
+            lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
+            slot_x = lcx + self.fleet_offset[0]
+            slot_y = lcy + self.fleet_offset[1]
+            if math.hypot(cx - slot_x, cy - slot_y) > self.fleet_stray_dist:
+                self._movement_override = (slot_x, slot_y)
+        elif self.fleet_leader is not None and not self.fleet_leader.alive:
+            self.fleet_leader = None
+
+        # ── Aim and fire ─────────────────────────────────────────────────
+        self._aim_and_fire(dt, cx, cy, all_ships, lasers)
+
+    # ── Tactic helpers ────────────────────────────────────────────────────────
+
+    def _calc_intercept_pos(self, cx: float, cy: float, target) -> tuple[float, float]:
+        """Predict where the target will be and return a cut-off position."""
+        ex = target.wx + target.width  / 2
+        ey = target.wy + target.height / 2
+        d  = math.hypot(ex - cx, ey - cy)
+        # Lead time: how long it takes us to close at max speed (scaled to converge, not overshoot)
+        t  = d / max(1.0, self.max_speed) * 0.55
+        return (ex + target.vx * t, ey + target.vy * t)
+
+    def _calc_flank_pos(self, cx: float, cy: float, target) -> tuple[float, float]:
+        """Return a position perpendicular to the target's movement direction."""
+        ex = target.wx + target.width  / 2
+        ey = target.wy + target.height / 2
+
+        spd = math.hypot(target.vx, target.vy)
+        if spd > 5.0:
+            # Perpendicular to the target's travel direction
+            nx, ny = target.vx / spd, target.vy / spd
+        else:
+            # Target is roughly stationary: use the line from self to target
+            dx, dy = ex - cx, ey - cy
+            d = math.hypot(dx, dy)
+            if d > 0:
+                nx, ny = dx / d, dy / d
+            else:
+                nx, ny = 1.0, 0.0
+
+        # Rotate 90° to get the perpendicular, scaled by flank_side so each
+        # ship consistently picks left or right and teams split naturally
+        px = -ny * self._flank_side
+        py =  nx * self._flank_side
+
+        return (ex + px * FLANK_OFFSET, ey + py * FLANK_OFFSET)
+
+    def _calc_retreat_pos(self, cx: float, cy: float, all_ships: list) -> tuple[float, float]:
+        """Return a flee destination directly away from the nearest enemy."""
+        nearest_enemy = None
+        nearest_dist  = float('inf')
+        for ship in all_ships:
+            if ship.team == self.team or not ship.alive:
+                continue
+            ex = ship.wx + ship.width  / 2
+            ey = ship.wy + ship.height / 2
+            d  = math.hypot(ex - cx, ey - cy)
+            if d < nearest_dist:
+                nearest_dist  = d
+                nearest_enemy = ship
+
+        if nearest_enemy is None:
+            return self.target  # no enemies: fall back to waypoint
+
+        ex = nearest_enemy.wx + nearest_enemy.width  / 2
+        ey = nearest_enemy.wy + nearest_enemy.height / 2
+        dx, dy = cx - ex, cy - ey
+        d = math.hypot(dx, dy)
+        if d > 0:
+            dx, dy = dx / d, dy / d
+        else:
+            dx, dy = 1.0, 0.0
+        return (cx + dx * 900, cy + dy * 900)
+
+    def _aim_and_fire(self, dt: float, cx: float, cy: float,
+                      all_ships: list, lasers: list) -> None:
+        """Aim weapons at the nearest in-range enemy and fire laser beams (instant hit)."""
+        best_dist   = self.attack_range
         best_target = None
         for ship in all_ships:
             if ship is self or ship.team == self.team or not ship.alive:
@@ -238,24 +575,62 @@ class AICharacter(Entity):
 
         self._has_target = best_target is not None
 
+        # Target world centre (lasers are instant — aim directly, no lead needed)
+        tx = ty = 0.0
         if best_target is not None:
-            ex = best_target.wx + best_target.width  / 2
-            ey = best_target.wy + best_target.height / 2
-            desired = math.atan2(ey - cy, ex - cx)
+            tx = best_target.wx + best_target.width  / 2
+            ty = best_target.wy + best_target.height / 2
 
-            # Rotate turret toward target
-            diff = self._angle_diff(desired, self.turret_angle)
-            step = math.copysign(min(abs(diff), TURRET_TURN_RATE * dt), diff)
-            raw  = self.turret_angle + step
-            self.turret_angle = math.atan2(math.sin(raw), math.cos(raw))
+        L_w   = self.width  / 2
+        W_w   = self.height / 2
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
 
-            # Fire when aligned and cooldown ready
-            self._fire_cooldown -= dt
-            if self._fire_cooldown <= 0 and abs(diff) < 0.25:
-                self._fire_cooldown = FIRE_RATE
-                bullets.append(Bullet(cx, cy, self.turret_angle, self.team))
-        else:
-            self._fire_cooldown = max(0.0, self._fire_cooldown - dt)
+        # ── Rotating turrets (capital ships, frigates) ────────────────────
+        if self.gun_type in ('turret', 'both'):
+            for turret in self.turrets:
+                tlx = turret['lx'] * L_w
+                tly = turret['ly'] * W_w
+                twx = cx + tlx * cos_a - tly * sin_a
+                twy = cy + tlx * sin_a + tly * cos_a
+
+                turret['cooldown'] -= dt
+
+                if best_target is not None:
+                    desired = math.atan2(ty - twy, tx - twx)
+                    diff    = self._angle_diff(desired, turret['angle'])
+                    step    = math.copysign(min(abs(diff), TURRET_TURN_RATE * dt), diff)
+                    raw     = turret['angle'] + step
+                    turret['angle'] = math.atan2(math.sin(raw), math.cos(raw))
+
+                    if turret['cooldown'] <= 0 and abs(diff) < 0.20:
+                        turret['cooldown'] = self.fire_rate
+                        best_target.take_damage(self.bullet_damage)
+                        lasers.append(Laser(twx, twy, tx, ty, self.team))
+                else:
+                    turret['cooldown'] = max(0.0, turret['cooldown'])
+
+        # ── Fixed forward guns (frigates, fighters) ───────────────────────
+        if self.gun_type in ('fixed', 'both'):
+            fire_aligned = False
+            if best_target is not None:
+                desired      = math.atan2(ty - cy, tx - cx)
+                fire_aligned = abs(self._angle_diff(desired, self.angle)) < FIXED_GUN_ARC
+
+            for gun in self.fixed_guns:
+                gun['cooldown'] -= dt
+                if fire_aligned and gun['cooldown'] <= 0:
+                    tlx = gun['lx'] * L_w
+                    tly = gun['ly'] * W_w
+                    twx = cx + tlx * cos_a - tly * sin_a
+                    twy = cy + tlx * sin_a + tly * cos_a
+                    gun['cooldown'] = self.fire_rate
+                    best_target.take_damage(self.bullet_damage)
+                    lasers.append(Laser(twx, twy, tx, ty, self.team))
+                elif not fire_aligned or best_target is None:
+                    gun['cooldown'] = max(0.0, gun['cooldown'])
+
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
     def take_damage(self, amount: int) -> None:
         self.hp -= amount
@@ -265,7 +640,7 @@ class AICharacter(Entity):
 
     def _turn_toward(self, target_angle: float, dt: float) -> None:
         diff = self._angle_diff(target_angle, self.angle)
-        step = math.copysign(min(abs(diff), self.TURN_RATE * dt), diff)
+        step = math.copysign(min(abs(diff), self.turn_rate * dt), diff)
         raw  = self.angle + step
         self.angle = math.atan2(math.sin(raw), math.cos(raw))
 
@@ -273,6 +648,8 @@ class AICharacter(Entity):
     def _angle_diff(target: float, current: float) -> float:
         """Shortest signed angle from current to target in [-π, π]."""
         return (target - current + math.pi) % (2 * math.pi) - math.pi
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
 
     def draw(self, surface: pygame.Surface, camera) -> None:
         if not self.alive or not camera.is_visible(self.world_rect):
@@ -285,8 +662,8 @@ class AICharacter(Entity):
 
         cos_a = math.cos(self.angle)
         sin_a = math.sin(self.angle)
-        L = self.width  / 2
-        W = self.height / 2
+        L = self.width  / 2 * camera.zoom
+        W = self.height / 2 * camera.zoom
 
         # Ship hull polygon
         local_pts = [
@@ -301,30 +678,55 @@ class AICharacter(Entity):
             return (lx * cos_a - ly * sin_a + cx,
                     lx * sin_a + ly * cos_a + cy)
 
+        # Engine glow when thrusting — drawn before hull so it appears underneath
+        if self._thrusting:
+            ex_s   = -L * 0.85 * cos_a + cx
+            ey_s   = -L * 0.85 * sin_a + cy
+            glow_r = max(2, int(W * 0.6))
+            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), glow_r)
+
         screen_pts = [to_screen(lx, ly) for lx, ly in local_pts]
         pygame.draw.polygon(surface, self.color, screen_pts)
         pygame.draw.polygon(surface, (255, 255, 255), screen_pts, 1)
 
-        # Engine glow
-        if self._thrusting:
-            ex_s = -L * 0.85 * cos_a + cx
-            ey_s = -L * 0.85 * sin_a + cy
-            glow_r = max(2, int(W * 0.6))
-            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), glow_r)
+        # Combat-state indicator dot on the nose of the ship
+        state_color = self._STATE_COLORS.get(self.combat_state, (128, 128, 128))
+        ind_x = int(cx + cos_a * (L * 0.65))
+        ind_y = int(cy + sin_a * (L * 0.65))
+        pygame.draw.circle(surface, (0, 0, 0),    (ind_x, ind_y), 4)
+        pygame.draw.circle(surface, state_color,  (ind_x, ind_y), 3)
 
-        # Turret base
-        base_r = max(3, int(W * 0.35))
-        turret_color = (200, 200, 200) if self._has_target else (130, 130, 130)
-        pygame.draw.circle(surface, (60, 60, 60),   (int(cx), int(cy)), base_r + 1)
-        pygame.draw.circle(surface, turret_color,   (int(cx), int(cy)), base_r)
-
-        # Turret barrel
-        barrel_len = max(int(L * 0.65), 10)
-        barrel_w   = max(2, int(W * 0.18))
-        tx_end = cx + math.cos(self.turret_angle) * barrel_len
-        ty_end = cy + math.sin(self.turret_angle) * barrel_len
-        pygame.draw.line(surface, turret_color,
-                         (int(cx), int(cy)), (int(tx_end), int(ty_end)), barrel_w)
+        # Weapons
+        gun_col = (200, 200, 200) if self._has_target else (130, 130, 130)
+        # Rotating turrets — capital ships and frigates
+        if self.gun_type in ('turret', 'both'):
+            base_r     = max(3, int(W * 0.35))
+            barrel_len = max(int(L * 0.65), 10)
+            barrel_w   = max(2, int(W * 0.18))
+            for turret in self.turrets:
+                tlx_s = turret['lx'] * L
+                tly_s = turret['ly'] * W
+                tscx  = cx + tlx_s * cos_a - tly_s * sin_a
+                tscy  = cy + tlx_s * sin_a + tly_s * cos_a
+                pygame.draw.circle(surface, (60, 60, 60), (int(tscx), int(tscy)), base_r + 1)
+                pygame.draw.circle(surface, gun_col, (int(tscx), int(tscy)), base_r)
+                tx_end = tscx + math.cos(turret['angle']) * barrel_len
+                ty_end = tscy + math.sin(turret['angle']) * barrel_len
+                pygame.draw.line(surface, gun_col,
+                                 (int(tscx), int(tscy)), (int(tx_end), int(ty_end)), barrel_w)
+        # Fixed forward gun barrels — frigates and fighters
+        if self.gun_type in ('fixed', 'both'):
+            barrel_len_f = max(int(L * 0.55), 6)
+            barrel_w_f   = max(1, int(W * 0.12))
+            for gun in self.fixed_guns:
+                glx_s = gun['lx'] * L
+                gly_s = gun['ly'] * W
+                gscx  = cx + glx_s * cos_a - gly_s * sin_a
+                gscy  = cy + glx_s * sin_a + gly_s * cos_a
+                ge_x  = gscx + cos_a * barrel_len_f
+                ge_y  = gscy + sin_a * barrel_len_f
+                pygame.draw.line(surface, gun_col,
+                                 (int(gscx), int(gscy)), (int(ge_x), int(ge_y)), barrel_w_f)
 
         # Health bar (only when damaged)
         if self.hp < self.max_hp:
@@ -336,4 +738,440 @@ class AICharacter(Entity):
             fill_w = int(bar_w * self.hp / self.max_hp)
             pygame.draw.rect(surface, (120, 0,   0), (bar_x, bar_y, bar_w,  bar_h))
             pygame.draw.rect(surface, (0,   210, 60), (bar_x, bar_y, fill_w, bar_h))
+            pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
+
+
+# ── Fighter ───────────────────────────────────────────────────────────────────
+
+_FIGHTER_COLORS = [(0, 210, 230), (240, 180, 20)]   # cyan / gold per team
+
+class Fighter(AICharacter):
+    """
+    Tiny interceptor deployed by Carriers.
+    Very fast and agile, but fragile and lightly armed.
+    """
+
+    LAUNCH_DURATION = 2.2   # seconds for catapult roll and climb-out
+    DOCK_RADIUS     = 85.0  # world units from carrier centre to trigger docking
+    RETURN_IDLE_T   = 9.0   # seconds without a target before starting return approach
+
+    def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
+                 team: int, home_carrier=None):
+        w = random.randint(20, 30)
+        h = random.randint(10, 16)
+        super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
+
+        # Override all stats — fighters are extreme in every direction
+        self.max_speed     = random.uniform(220, 275)
+        self.thrust        = random.uniform(180, 230)
+        self.turn_rate     = random.uniform(5.0, 7.0)
+        self.fire_rate     = random.uniform(0.7, 1.2)
+        self.bullet_damage = random.randint(4, 8)
+        self.max_hp        = random.randint(10, 20)
+        self.hp            = self.max_hp
+        self.color         = _FIGHTER_COLORS[team]
+        self.role          = 'attacker'   # fighters always push forward
+        self.home_carrier  = home_carrier
+
+        # Launch / return state
+        self._launch_t     = self.LAUNCH_DURATION
+        self._launch_angle = home_carrier.angle if home_carrier is not None else self.angle
+        self._returning    = False   # True while flying back to dock on the carrier
+        self._idle_t       = 0.0    # seconds elapsed with no combat target
+
+        # Fixed forward wing-mounted guns — no rotating turret
+        self.gun_type   = 'fixed'
+        self.turrets    = []
+        self.fixed_guns = [
+            {'lx': 0.15, 'ly': -0.7, 'cooldown': random.uniform(0, self.fire_rate)},
+            {'lx': 0.15, 'ly':  0.7, 'cooldown': random.uniform(0, self.fire_rate)},
+        ]
+
+    def update(self, dt: float) -> None:
+        if self._launch_t > 0:
+            # Catapult roll: linear acceleration from 0 → max_speed along carrier heading
+            self._launch_t -= dt
+            progress      = 1.0 - max(0.0, self._launch_t) / self.LAUNCH_DURATION
+            self.angle    = self._launch_angle
+            self.vx       = math.cos(self._launch_angle) * self.max_speed * progress
+            self.vy       = math.sin(self._launch_angle) * self.max_speed * progress
+            self.wx      += self.vx * dt
+            self.wy      += self.vy * dt
+            self._thrusting = True
+        elif self._returning and self.home_carrier is not None and self.home_carrier.alive:
+            # Dock when centre of fighter reaches DOCK_RADIUS of carrier centre
+            hcx = self.home_carrier.wx + self.home_carrier.width  / 2
+            hcy = self.home_carrier.wy + self.home_carrier.height / 2
+            fx  = self.wx + self.width  / 2
+            fy  = self.wy + self.height / 2
+            if math.hypot(fx - hcx, fy - hcy) < self.DOCK_RADIUS:
+                self.alive = False   # docked — carrier draw() will show it as parked
+                return
+            super().update(dt)
+        else:
+            if self._returning:
+                self._returning = False   # carrier is gone; fight independently
+            super().update(dt)
+
+    def update_combat(self, dt: float, all_ships: list, lasers: list) -> None:
+        if self._launch_t > 0:
+            return   # weapons hold during launch roll
+
+        # ── Returning to carrier ──────────────────────────────────────────────
+        if self._returning:
+            if self.home_carrier is None or not self.home_carrier.alive:
+                self._returning = False   # carrier destroyed; fight on
+            else:
+                hcx   = self.home_carrier.wx + self.home_carrier.width  / 2
+                hcy   = self.home_carrier.wy + self.home_carrier.height / 2
+                cos_a = math.cos(self.home_carrier.angle)
+                sin_a = math.sin(self.home_carrier.angle)
+                # Aim for the carrier bow so the approach looks like a landing
+                self._movement_override = (
+                    hcx + cos_a * self.home_carrier.width * 0.40,
+                    hcy + sin_a * self.home_carrier.width * 0.40,
+                )
+                self.combat_state = 'patrol'
+            return
+
+        # ── Normal combat (inherited) ─────────────────────────────────────────
+        super().update_combat(dt, all_ships, lasers)
+
+        # ── Idle timer: return to carrier when no enemies for a while ─────────
+        if (self._current_target is None
+                and self.home_carrier is not None
+                and self.home_carrier.alive):
+            self._idle_t += dt
+            if self._idle_t >= self.RETURN_IDLE_T:
+                self._returning = True
+                self._idle_t    = 0.0
+        else:
+            self._idle_t = 0.0
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive or not camera.is_visible(self.world_rect):
+            return
+
+        cx, cy = camera.world_to_screen(
+            self.wx + self.width  / 2,
+            self.wy + self.height / 2,
+        )
+
+        z     = camera.zoom
+        L     = self.width  / 2 * z
+        W     = self.height / 2 * z
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+
+        def to_screen(lx, ly):
+            return (lx * cos_a - ly * sin_a + cx,
+                    lx * sin_a + ly * cos_a + cy)
+
+        # Delta-wing arrowhead hull
+        local_pts = [
+            ( L,      0.0  ),   # nose
+            ( 0.0,    W    ),   # starboard wing tip
+            (-L * 0.5, W * 0.3),
+            (-L,       0.0 ),   # tail
+            (-L * 0.5,-W * 0.3),
+            ( 0.0,   -W    ),   # port wing tip
+        ]
+        # Engine glow — drawn before hull so it appears underneath
+        if self._thrusting:
+            ex_s = -L * 0.7 * cos_a + cx
+            ey_s = -L * 0.7 * sin_a + cy
+            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), max(2, int(W * 0.5)))
+
+        pts = [to_screen(lx, ly) for lx, ly in local_pts]
+        pygame.draw.polygon(surface, self.color, pts)
+        pygame.draw.polygon(surface, (255, 255, 255), pts, 1)
+
+        # Fixed forward wing guns pointing in ship direction
+        gun_col    = (220, 220, 220) if self._has_target else (110, 110, 110)
+        barrel_len = max(int(L * 0.5), 3)
+        for gun in self.fixed_guns:
+            glx_s = gun['lx'] * L
+            gly_s = gun['ly'] * W
+            gscx  = cx + glx_s * cos_a - gly_s * sin_a
+            gscy  = cy + glx_s * sin_a + gly_s * cos_a
+            ge_x  = gscx + cos_a * barrel_len
+            ge_y  = gscy + sin_a * barrel_len
+            pygame.draw.line(surface, gun_col,
+                             (int(gscx), int(gscy)), (int(ge_x), int(ge_y)), 1)
+
+        # State dot (doubles as the "cockpit" mark)
+        state_color = self._STATE_COLORS.get(self.combat_state, (128, 128, 128))
+        pygame.draw.circle(surface, state_color, (int(cx), int(cy)), max(2, int(W * 0.45)))
+
+        # Health bar
+        if self.hp < self.max_hp:
+            half_diag = math.hypot(L, W)
+            bar_w  = max(10, int(L * 1.8))
+            bar_h  = 2
+            bar_x  = int(cx - bar_w // 2)
+            bar_y  = int(cy - half_diag - 5)
+            fill_w = int(bar_w * self.hp / self.max_hp)
+            pygame.draw.rect(surface, (120, 0,  0), (bar_x, bar_y, bar_w,  bar_h))
+            pygame.draw.rect(surface, (0, 210, 60), (bar_x, bar_y, fill_w, bar_h))
+
+
+# ── Carrier ───────────────────────────────────────────────────────────────────
+
+_CARRIER_COLORS = [(25, 55, 140), (140, 20, 20)]   # dark navy / dark crimson
+
+class Carrier(AICharacter):
+    """
+    Massive ship that stays behind the front line and deploys Fighter squadrons.
+    Armed only with light AA guns (short range, fast fire, low damage).
+    Relies on capital ships and frigates for heavy combat.
+    Deploys fighters both proactively and defensively when enemies are detected.
+    """
+
+    MAX_FIGHTERS    = 5      # maximum active fighters per carrier
+    DEPLOY_INTERVAL = 10.0   # seconds between fighter deployments
+
+    # Six possible AA turret positions around the hull perimeter (lx_frac, ly_frac)
+    _AA_POSITIONS = [
+        ( 0.55, -0.45), ( 0.55,  0.45),   # fore port / starboard
+        (-0.05, -0.52), (-0.05,  0.52),   # mid  port / starboard
+        (-0.65, -0.42), (-0.65,  0.42),   # aft  port / starboard
+    ]
+
+    def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
+                 team: int):
+        w = random.randint(180, 240)
+        h = random.randint(80, 120)
+        super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
+
+        # Override stats: slow, tanky, light AA armament
+        self.max_speed     = random.uniform(28, 46)
+        self.thrust        = random.uniform(25, 40)
+        self.turn_rate     = random.uniform(0.4, 0.85)
+        self.fire_rate     = random.uniform(0.4, 0.65)   # AA fires rapidly...
+        self.bullet_damage = random.randint(2, 4)          # ...but tickles
+        self.max_hp        = random.randint(220, 350)
+        self.hp            = self.max_hp
+        self.attack_range  = AA_RANGE                      # short AA range only
+        self.color         = _CARRIER_COLORS[team]
+        self.role          = 'carrier'
+
+        # Build AA turrets (4-6 positions around the hull)
+        num_aa = random.choice([4, 4, 5, 6])
+        chosen = random.sample(self._AA_POSITIONS, num_aa)
+        self.turrets = [
+            {
+                'lx': lx, 'ly': ly,
+                'angle':    random.uniform(0, math.tau),
+                'cooldown': random.uniform(0, self.fire_rate),
+            }
+            for lx, ly in chosen
+        ]
+
+        # Fighter management
+        self._deploy_timer   = random.uniform(0, self.DEPLOY_INTERVAL * 0.5)
+        self._active_fighters: list  = []   # references tracked for headcount
+        self._spawn_queue:    list  = []    # (wx, wy, team) tuples; processed by main.py
+
+    # ── Combat override ───────────────────────────────────────────────────────
+
+    def update_combat(self, dt: float, all_ships: list, lasers: list) -> None:
+        if not self.alive:
+            return
+
+        cx = self.wx + self.width  / 2
+        cy = self.wy + self.height / 2
+
+        # Separation — carriers need more personal space than frigates
+        for ship in all_ships:
+            if ship is self or ship.team != self.team or not ship.alive:
+                continue
+            ox = ship.wx + ship.width  / 2
+            oy = ship.wy + ship.height / 2
+            d  = math.hypot(ox - cx, oy - cy)
+            if 0 < d < SEPARATION_DIST * 1.6:
+                strength = (SEPARATION_DIST * 1.6 - d) / (SEPARATION_DIST * 1.6) * SEPARATION_FORCE
+                self._sep_ax += (cx - ox) / d * strength
+                self._sep_ay += (cy - oy) / d * strength
+
+        # Find nearest enemy (used for movement and deployment decisions)
+        nearest_enemy = None
+        nearest_dist  = float('inf')
+        for ship in all_ships:
+            if ship.team == self.team or not ship.alive:
+                continue
+            ex = ship.wx + ship.width  / 2
+            ey = ship.wy + ship.height / 2
+            d  = math.hypot(ex - cx, ey - cy)
+            if d < nearest_dist:
+                nearest_dist  = d
+                nearest_enemy = ship
+
+        # Movement: hang back at a safe distance — never charge the front line
+        SAFE_DIST = ATTACK_RANGE * 1.8
+        if nearest_enemy is not None and nearest_dist < SAFE_DIST:
+            self.combat_state = 'retreat'
+            ex = nearest_enemy.wx + nearest_enemy.width  / 2
+            ey = nearest_enemy.wy + nearest_enemy.height / 2
+            dx, dy = cx - ex, cy - ey
+            d = math.hypot(dx, dy)
+            if d > 0:
+                dx, dy = dx / d, dy / d
+            self._movement_override = (cx + dx * 700, cy + dy * 700)
+        else:
+            self.combat_state       = 'patrol'
+            self._movement_override = None
+
+        # AA guns fire at enemies that get within AA_RANGE
+        self._aim_and_fire(dt, cx, cy, all_ships, lasers)
+
+        # ── Fighter deployment ─────────────────────────────────────────────
+        # Prune dead fighters from the active list
+        self._active_fighters = [f for f in self._active_fighters if f.alive]
+        live_count = len(self._active_fighters)
+
+        enemy_detected    = nearest_enemy is not None and nearest_dist < ATTACK_RANGE * 2.2
+        under_direct_fire = nearest_dist < AA_RANGE * 1.5
+
+        self._deploy_timer -= dt
+
+        if enemy_detected and live_count < self.MAX_FIGHTERS:
+            # Emergency scramble: bypass timer when enemy is dangerously close
+            # and we have fewer than half our fighters up
+            if under_direct_fire and live_count < self.MAX_FIGHTERS // 2:
+                self._queue_fighter(cx, cy)
+                self._deploy_timer = self.DEPLOY_INTERVAL * 0.4
+
+            elif self._deploy_timer <= 0:
+                self._queue_fighter(cx, cy)
+                self._deploy_timer = self.DEPLOY_INTERVAL
+
+    def _queue_fighter(self, cx: float, cy: float) -> None:
+        """Push a spawn request onto the queue; main.py creates the Fighter."""
+        # Spawn at the carrier bow so the launch animation slides off the deck
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        bow_x = cx + cos_a * (self.width * 0.42)
+        bow_y = cy + sin_a * (self.width * 0.42)
+        self._spawn_queue.append((bow_x, bow_y, self.team))
+
+    # ── Rendering override ────────────────────────────────────────────────────
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive or not camera.is_visible(self.world_rect):
+            return
+
+        cx, cy = camera.world_to_screen(
+            self.wx + self.width  / 2,
+            self.wy + self.height / 2,
+        )
+
+        z     = camera.zoom
+        L     = self.width  / 2 * z
+        W     = self.height / 2 * z
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+
+        def to_screen(lx, ly):
+            return (lx * cos_a - ly * sin_a + cx,
+                    lx * sin_a + ly * cos_a + cy)
+
+        # Engine glow — drawn before hull so it appears underneath
+        if self._thrusting:
+            ex_s   = -L * 0.90 * cos_a + cx
+            ey_s   = -L * 0.90 * sin_a + cy
+            glow_r = max(3, int(W * 0.55))
+            pygame.draw.circle(surface, (255, 180, 40), (int(ex_s), int(ey_s)), glow_r)
+
+        # Hull — long rectangular carrier silhouette
+        hull_pts = [
+            ( L,        W * 0.20),
+            ( L,       -W * 0.20),
+            ( L * 0.78, -W * 0.58),
+            (-L * 0.75, -W * 0.62),
+            (-L,        -W * 0.46),
+            (-L,         W * 0.46),
+            (-L * 0.75,  W * 0.62),
+            ( L * 0.78,  W * 0.58),
+        ]
+        hull_screen = [to_screen(lx, ly) for lx, ly in hull_pts]
+        pygame.draw.polygon(surface, self.color, hull_screen)
+        pygame.draw.polygon(surface, (200, 200, 200), hull_screen, 1)
+
+        # Flight deck — lighter strip running the length of the ship
+        deck_color = (
+            min(255, self.color[0] + 35),
+            min(255, self.color[1] + 35),
+            min(255, self.color[2] + 35),
+        )
+        deck_pts = [
+            to_screen( L * 0.88,  W * 0.10),
+            to_screen(-L * 0.82,  W * 0.10),
+            to_screen(-L * 0.82, -W * 0.08),
+            to_screen( L * 0.88, -W * 0.08),
+        ]
+        pygame.draw.polygon(surface, deck_color, deck_pts)
+
+        # Parked fighters on the flight deck
+        in_hangar = max(0, self.MAX_FIGHTERS - sum(1 for f in self._active_fighters if f.alive))
+        if in_hangar > 0 and L > 10:
+            fw    = max(3, int(L * 0.090))   # fighter half-length in screen px
+            fh    = max(2, int(fw * 0.48))   # fighter half-width
+            f_col = _FIGHTER_COLORS[self.team]
+            x_min_f = -0.58
+            x_max_f =  0.68
+            step_f  = (x_max_f - x_min_f) / max(1, self.MAX_FIGHTERS - 1)
+            for s in range(in_hangar):
+                slot_lx = (x_min_f + s * step_f) * L
+                slot_ly = 0.01 * W
+                fsx = cx + slot_lx * cos_a - slot_ly * sin_a
+                fsy = cy + slot_lx * sin_a + slot_ly * cos_a
+                # Tiny arrowhead pointing in carrier heading direction
+                nose = (fsx + cos_a * fw,                       fsy + sin_a * fw)
+                wl   = (fsx - cos_a * fw * 0.55 + sin_a * fh,   fsy - sin_a * fw * 0.55 - cos_a * fh)
+                wr   = (fsx - cos_a * fw * 0.55 - sin_a * fh,   fsy - sin_a * fw * 0.55 + cos_a * fh)
+                pygame.draw.polygon(surface, f_col, [nose, wl, wr])
+
+        # Island superstructure (starboard side)
+        isl_color = (
+            min(255, self.color[0] + 55),
+            min(255, self.color[1] + 55),
+            min(255, self.color[2] + 55),
+        )
+        isl_pts = [
+            to_screen( L * 0.25,  W * 0.48),
+            to_screen(-L * 0.10,  W * 0.48),
+            to_screen(-L * 0.10,  W * 0.65),
+            to_screen( L * 0.25,  W * 0.65),
+        ]
+        pygame.draw.polygon(surface, isl_color, isl_pts)
+        pygame.draw.polygon(surface, (220, 220, 220), isl_pts, 1)
+
+        # AA turrets (small, many)
+        aa_base_r   = max(2, int(W * 0.18))
+        aa_barrel   = max(int(L * 0.22), 6)
+        aa_col      = (190, 220, 190) if self._has_target else (120, 140, 120)
+        for turret in self.turrets:
+            tscx = cx + (turret['lx'] * L) * cos_a - (turret['ly'] * W) * sin_a
+            tscy = cy + (turret['lx'] * L) * sin_a + (turret['ly'] * W) * cos_a
+            pygame.draw.circle(surface, (40, 40, 40),  (int(tscx), int(tscy)), aa_base_r + 1)
+            pygame.draw.circle(surface, aa_col,         (int(tscx), int(tscy)), aa_base_r)
+            tx_end = tscx + math.cos(turret['angle']) * aa_barrel
+            ty_end = tscy + math.sin(turret['angle']) * aa_barrel
+            pygame.draw.line(surface, aa_col, (int(tscx), int(tscy)), (int(tx_end), int(ty_end)), 1)
+
+        # Combat-state dot
+        state_color = self._STATE_COLORS.get(self.combat_state, (128, 128, 128))
+        pygame.draw.circle(surface, (0, 0, 0),   (int(cx), int(cy)), 5)
+        pygame.draw.circle(surface, state_color, (int(cx), int(cy)), 4)
+
+        # Health bar
+        if self.hp < self.max_hp:
+            half_diag = math.hypot(L, W)
+            bar_w  = max(30, int(L * 2.4))
+            bar_h  = 5
+            bar_x  = int(cx - bar_w // 2)
+            bar_y  = int(cy - half_diag - 10)
+            fill_w = int(bar_w * self.hp / self.max_hp)
+            pygame.draw.rect(surface, (120, 0,   0), (bar_x, bar_y, bar_w,  bar_h))
+            pygame.draw.rect(surface, (0,  210, 60), (bar_x, bar_y, fill_w, bar_h))
             pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
