@@ -35,7 +35,7 @@ WORLD_W, WORLD_H  = 4000 * map_scale_factor, 3200 * map_scale_factor
 # Target frame rate for the main loop.
 FPS = 60
 
-# Number of AI characters to spawn on the map.
+# Number of AI characters to spawn on the map. 10000 is the limit before performace starts declining
 NUM_AI = 100
 
 # Colours used for the world background, and HUD overlays.
