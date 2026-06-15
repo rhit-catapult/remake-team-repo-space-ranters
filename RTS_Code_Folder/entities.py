@@ -36,7 +36,7 @@ class Player(Entity):
     SPEED = 200  # world units per second
 
     def __init__(self, wx: float, wy: float):
-        super().__init__(wx, wy, 32, 32, (80, 180, 255))
+        super().__init__(wx, wy, 8, 8, (80, 180, 255))
 
     def update(self, dt: float):
         keys = pygame.key.get_pressed()
@@ -53,7 +53,7 @@ class Player(Entity):
         # Draw a direction indicator dot
         if camera.is_visible(self.world_rect):
             cx, cy = camera.world_to_screen(self.wx + self.width / 2, self.wy + self.height / 2)
-            pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 5)
+            pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 2)
 
 
 class AICharacter(Entity):
@@ -66,7 +66,7 @@ class AICharacter(Entity):
     SPEED = 80  # world units per second
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]]):
-        super().__init__(wx, wy, 28, 28, (255, 140, 60))
+        super().__init__(wx, wy, 7, 7, (255, 140, 60))
         self.waypoints = waypoints
         self.current_wp = 0
 
@@ -94,8 +94,8 @@ class AICharacter(Entity):
             cx = self.wx + self.width / 2
             cy = self.wy + self.height / 2
             angle = math.atan2(ty - cy, tx - cx)
-            tip_wx = cx + math.cos(angle) * 20
-            tip_wy = cy + math.sin(angle) * 20
+            tip_wx = cx + math.cos(angle) * 5
+            tip_wy = cy + math.sin(angle) * 5
             tip_sx = camera.world_to_screen(tip_wx, tip_wy)
             centre_sx = camera.world_to_screen(cx, cy)
             pygame.draw.line(surface, (255, 220, 100), centre_sx, tip_sx, 2)

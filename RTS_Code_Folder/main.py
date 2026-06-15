@@ -18,6 +18,7 @@ Controls:
 """
 
 import sys
+import random
 import pygame
 from camera import Camera
 from entities import Player, AICharacter
@@ -33,6 +34,9 @@ WORLD_W, WORLD_H  = 4000 * map_scale_factor, 3200 * map_scale_factor
 
 # Target frame rate for the main loop.
 FPS = 60
+
+# Number of AI characters to spawn on the map.
+NUM_AI = 100
 
 # Colours used for the world background, and HUD overlays.
 BG_DARK  = (0, 0, 0)
@@ -107,7 +111,7 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
         f"FPS: {fps:.0f}",
         f"Camera world pos: ({camera.x:.0f}, {camera.y:.0f})",
         f"Follow mode: {'ON' if follow_mode else 'OFF (RMB drag)'}",
-        f"Focus: {['Player', 'AI-1', 'AI-2'][focus_idx]}",
+        f"Focus: {'Player' if focus_idx == 0 else f'AI-{focus_idx}'}",
         "",
         "WASD/Arrows = move player",
         "F = toggle follow   Tab = cycle focus",
@@ -142,8 +146,9 @@ def draw_hud(screen: pygame.Surface, camera: Camera, entities: list,
     pygame.draw.rect(mm, (160, 160, 200), (vp_x, vp_y, vp_w, vp_h), 1)
 
     # Draw dots for each entity's world position on the minimap.
-    colours = [(80, 180, 255), (255, 140, 60), (255, 200, 60)]
-    for ent, col in zip(entities, colours):
+    # Player is blue; all AI characters are orange.
+    for i, ent in enumerate(entities):
+        col = (80, 180, 255) if i == 0 else (255, 140, 60)
         mx, my = to_mm(ent.wx, ent.wy)
         pygame.draw.circle(mm, col, (mx, my), 3)
 
@@ -165,15 +170,16 @@ def main():
 
     player = Player(400 + 100, 300 + 80)  # Player start position in world space.
 
-    # Two AI characters, each with its own route of world-space waypoints.
-    ai1 = AICharacter(1500, 800, [
-        (1500, 800), (2600, 400), (2200, 1800), (800, 1600), (400, 300),
-    ])
-    ai2 = AICharacter(2200, 1800, [
-        (2200, 1800), (400, 300), (1500, 800), (800, 1600), (2600, 400),
-    ])
+    # Generate AI characters at random world positions with random waypoints.
+    ai_characters = []
+    for _ in range(NUM_AI):
+        waypoints = [
+            (random.randint(200, WORLD_W - 200), random.randint(200, WORLD_H - 200))
+            for _ in range(5)
+        ]
+        ai_characters.append(AICharacter(waypoints[0][0], waypoints[0][1], waypoints))
 
-    entities = [player, ai1, ai2]  # All world entities updated and drawn each frame.
+    entities = [player] + ai_characters  # All world entities updated and drawn each frame.
 
     follow_mode = True  # Whether the camera should track the selected focus entity.
     focus_idx   = 0     # Index of the current camera focus: 0=player, 1=ai1, 2=ai2.
