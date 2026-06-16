@@ -110,11 +110,12 @@ class Planet(Entity):
         self.wx = self.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
         self.wy = self.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
 
-    def draw(self, surface: pygame.Surface, camera) -> None:
-        sx, sy = camera.world_to_screen(self.star_x, self.star_y)
-        orbit_r = int(self.orbit_radius * camera.zoom)
-        if orbit_r > 2:
-            pygame.draw.circle(surface, (80, 80, 90), (sx, sy), orbit_r, 1)
+    def draw(self, surface: pygame.Surface, camera, show_orbit: bool = True) -> None:
+        if show_orbit:
+            sx, sy = camera.world_to_screen(self.star_x, self.star_y)
+            orbit_r = int(self.orbit_radius * camera.zoom)
+            if orbit_r > 2:
+                pygame.draw.circle(surface, (80, 80, 90), (sx, sy), orbit_r, 1)
 
         if not camera.is_visible(self.world_rect):
             return
@@ -142,6 +143,9 @@ class Constructor(Entity):
         self.build_timer = 5.0
         self.build_interval = 9.0
         self.built_count = 0
+        self.time = 0.0
+        self.smoke_timer = 0.0
+        self.smoke = []  # list of [dx, dy, vy, life, max_life, size]
         radius = 18
         color = self._COLORS[team]
         super().__init__(home_planet.star_x + math.cos(angle) * orbit_radius - radius,
@@ -153,6 +157,28 @@ class Constructor(Entity):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
         self.wx = self.home_planet.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
         self.wy = self.home_planet.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
+        self.time += dt
+
+        # Smokestack puffs — constant low-rate plume, faster while actively building
+        self.smoke_timer -= dt
+        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
+        spawn_rate = 0.5 - 0.3 * progress
+        if self.smoke_timer <= 0.0:
+            self.smoke_timer = spawn_rate
+            for chimney_dx in (-self.radius * 0.5, self.radius * 0.5):
+                self.smoke.append([
+                    chimney_dx + random.uniform(-2, 2),
+                    -self.radius * 0.9,
+                    -random.uniform(8, 14),
+                    0.0,
+                    random.uniform(1.0, 1.6),
+                    random.uniform(3, 5),
+                ])
+        for puff in self.smoke:
+            puff[3] += dt
+            puff[1] += puff[2] * dt
+            puff[0] += math.sin(self.time * 2.0 + puff[1]) * 6 * dt
+        self.smoke = [p for p in self.smoke if p[3] < p[4]]
 
         self.build_timer -= dt
         if self.build_timer <= 0.0:
@@ -172,16 +198,70 @@ class Constructor(Entity):
             return 'Destroyer'
         return self._BUILD_ORDER[self.built_count % len(self._BUILD_ORDER)]
 
+    @staticmethod
+    def _poly_points(cx, cy, r, sides, rotation=0.0):
+        return [
+            (cx + math.cos(rotation + i * math.tau / sides) * r,
+             cy + math.sin(rotation + i * math.tau / sides) * r)
+            for i in range(sides)
+        ]
+
     def draw(self, surface: pygame.Surface, camera) -> None:
         if not camera.is_visible(self.world_rect):
             return
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         r = max(2, int(self.radius * camera.zoom))
-        pygame.draw.circle(surface, self.color, (cx, cy), r)
-        pygame.draw.circle(surface, (255, 255, 255), (cx, cy), r, 1)
+        zoom = camera.zoom
+        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
+        dark = tuple(max(0, c - 90) for c in self.color)
+
+        # Soft pulsing glow while building, drawn on an alpha layer
+        if progress > 0.0:
+            glow_r = int(r * (1.6 + 0.25 * math.sin(self.time * 4.0)))
+            glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
+            alpha = int(70 * progress)
+            pygame.draw.circle(glow, (255, 220, 100, alpha), (glow_r, glow_r), glow_r)
+            surface.blit(glow, (cx - glow_r, cy - glow_r))
+
+        # Smokestack plumes (drawn behind the hull)
+        for dx, dy, _vy, life, max_life, size in self.smoke:
+            fade = max(0.0, 1.0 - life / max_life)
+            if fade <= 0.0:
+                continue
+            px, py = cx + dx * zoom, cy + dy * zoom
+            psize = max(1, int(size * zoom * (1.0 + life)))
+            shade = int(120 + 60 * fade)
+            puff = pygame.Surface((psize * 2, psize * 2), pygame.SRCALPHA)
+            pygame.draw.circle(puff, (shade, shade, shade, int(160 * fade)), (psize, psize), psize)
+            surface.blit(puff, (px - psize, py - psize))
+
+        # Octagonal factory hull with industrial girder cross-bracing
+        hull_rot = self.time * 0.15
+        hull_pts = self._poly_points(cx, cy, r, 8, hull_rot)
+        pygame.draw.polygon(surface, self.color, hull_pts)
+        pygame.draw.polygon(surface, (255, 255, 255), hull_pts, 1)
+        for i in range(0, 8, 2):
+            pygame.draw.line(surface, dark, hull_pts[i], hull_pts[(i + 4) % 8], max(1, int(zoom)))
+
+        # Twin smokestacks
+        for chimney_dx in (-r * 0.5, r * 0.5):
+            top = (cx + chimney_dx, cy - r * 0.9)
+            base = (cx + chimney_dx, cy - r * 0.4)
+            pygame.draw.line(surface, dark, base, top, max(2, int(3 * zoom)))
+
+        # Blinking corner lights — staggered phase per vertex
+        for i, (px, py) in enumerate(hull_pts):
+            brightness = 0.5 + 0.5 * math.sin(self.time * 3.0 + i * 0.8)
+            light_color = (255, int(180 + 60 * brightness), int(60 * brightness))
+            pygame.draw.circle(surface, light_color, (int(px), int(py)), max(1, int(2 * zoom)))
+
+        # Rotating central gearwork — two interlocking gears spinning opposite ways
+        gear_r = max(2, int(r * 0.45))
+        for spin_dir, offset in ((1, 0.0), (-1, math.pi)):
+            gear_pts = self._poly_points(cx, cy, gear_r, 6, spin_dir * self.time * 1.5 + offset)
+            pygame.draw.polygon(surface, dark, gear_pts, max(1, int(2 * zoom)))
 
         # Build progress ring
-        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
         if progress > 0.0:
             end_angle = progress * math.tau
             steps = 18

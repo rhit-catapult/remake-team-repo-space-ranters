@@ -699,7 +699,7 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
         "LMB: Select   Shift+LMB: Add/Remove",
         "Drag LMB: Box select   Ctrl+A: All",
         "RMB: Move/Follow/Attack   A+RMB: Attack-move",
-        "Shift+RMB: Queue   Ctrl+1-9: Group   H: Hold   F: Hold fire",
+        "Shift+RMB: Queue   Ctrl+1-9: Group   H: Hold   F: Hold fire   Tab: Toggle HUD",
     ]
     hint_y = screen_h - len(hints) * 16 - 8
     for i, h in enumerate(hints):
@@ -730,10 +730,13 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
         r = 3 if isinstance(ship, Carrier) else 1
         pygame.draw.circle(mm, col, (mx2, my2), r)
 
-    # Camera viewport rect on minimap
+    # Camera viewport rect on minimap — sized to the world area actually
+    # visible on screen, so it shrinks/grows as the player zooms in/out.
     vp_x, vp_y = to_mm(camera.x, camera.y)
-    vp_w2 = max(1, int(camera.screen_width  / WORLD_W * mm_w))
-    vp_h2 = max(1, int(camera.screen_height / WORLD_H * mm_h))
+    visible_w  = camera.screen_width  / camera.zoom
+    visible_h  = camera.screen_height / camera.zoom
+    vp_w2 = max(1, int(visible_w / WORLD_W * mm_w))
+    vp_h2 = max(1, int(visible_h / WORLD_H * mm_h))
     pygame.draw.rect(mm, (120, 120, 160), (vp_x, vp_y, vp_w2, vp_h2), 1)
 
     screen.blit(mm, (mm_x, mm_y))
@@ -860,6 +863,10 @@ def main():
     quit_confirm = False
     resume_button = None
 
+    # HUD visibility (status panel, minimap, banner, control hints, and the
+    # planet orbit guide-lines) — toggled with Tab for a clean battle view.
+    hud_visible = True
+
     def render_frame():
         screen_w, screen_h = screen.get_size()
         vp_w = max(1, int(screen_w / camera.zoom))
@@ -871,7 +878,10 @@ def main():
             pygame.transform.scale(region, (screen_w, screen_h), screen)
 
         for entity in solar_entities:
-            entity.draw(screen, camera)
+            if isinstance(entity, Planet):
+                entity.draw(screen, camera, show_orbit=hud_visible)
+            else:
+                entity.draw(screen, camera)
 
         for ship in ai_characters:
             ship.draw(screen, camera)
@@ -895,8 +905,9 @@ def main():
         if lmb_start is not None:
             draw_select_box(screen, lmb_start, pygame.mouse.get_pos())
 
-        draw_hud(screen, camera, ai_characters, player_team,
-                 selected_ships, clock.get_fps(), screen_w, screen_h, player_orders)
+        if hud_visible:
+            draw_hud(screen, camera, ai_characters, player_team,
+                     selected_ships, clock.get_fps(), screen_w, screen_h, player_orders)
 
     while True:
         dt        = clock.tick(FPS) / 1000.0
@@ -968,6 +979,10 @@ def main():
                     new_hf = not all(s.hold_fire for s in selected_ships)
                     for s in selected_ships:
                         s.hold_fire = new_hf
+
+                # ── Toggle HUD (status panel, minimap, hints, orbit lines) ─────
+                if event.key == pygame.K_TAB:
+                    hud_visible = not hud_visible
 
             # ── Zoom ──────────────────────────────────────────────────────────
             if event.type == pygame.MOUSEWHEEL:
