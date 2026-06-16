@@ -16,11 +16,16 @@ from main import setup_game, update_team_strategy, _make_waypoints, _team_spawn_
 
 
 def run_match(commander0_factory, commander1_factory,
-              max_seconds: float = 120.0, dt: float = 0.05) -> dict:
+              max_seconds: float = 120.0, dt: float = 0.05, on_tick=None) -> dict:
     """Simulate one match between two commanders, one per team.
 
     commanderN_factory(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h)
     must return an object with .update(dt, ai_characters).
+
+    on_tick(ai_characters, commander0, commander1), if given, is called once
+    per simulated frame — e.g. for a trainer that wants to sample game
+    states at its own cadence rather than collecting trajectories off the
+    commanders themselves.
 
     Returns a dict of final stats plus the two commander instances (so a
     trainer can pull per-decision trajectories off them if they recorded any).
@@ -57,6 +62,9 @@ def run_match(commander0_factory, commander1_factory,
 
         commander0.update(dt, ai_characters)
         commander1.update(dt, ai_characters)
+
+        if on_tick is not None:
+            on_tick(ai_characters, commander0, commander1)
 
         new_fighters = []
         for ship in ai_characters:

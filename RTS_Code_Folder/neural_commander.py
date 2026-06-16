@@ -2,16 +2,23 @@
 neural_commander.py — Neural-network fleet commander.
 
 Same role as AICommander (commander.py): decide when the fleet commits to a
-push and where each fleet should rally. Where AICommander uses a fixed
-push-fraction lookup table keyed on team_strength_ratio, NeuralCommander
-asks a small trained policy network for a *per-fleet* push fraction and
-target choice every decision tick, learned via self-play (see
-train_commander.py).
+push and where each fleet should rally. Where AICommander uses one fixed
+push-fraction lookup table for the whole team, NeuralCommander asks a small
+trained network for a *per-fleet* push fraction and target choice every
+decision tick.
+
+The network is trained by imitation learning (see train_commander.py):
+generate realistic game states from fast rule-based-vs-rule-based matches,
+label each fleet's ideal (push fraction, target fleet) with a richer
+per-fleet version of AICommander's own heuristic, and fit the network to
+reproduce those labels via ordinary supervised learning. That trains in
+minutes instead of the hours self-play reinforcement learning would need,
+while still outputting genuine per-fleet tactics instead of one team-wide
+rally point.
 
 The observation is egocentric: features are always framed as "own" vs
-"enemy", with world-x mirrored for team 1, so the same network weights
-produce sensible behaviour for either team and are trainable via symmetric
-self-play. Fleets are identified by rank (strongest-HP-first), not by
+"enemy", with world-x mirrored for team 1, so the same weights work for
+either team. Fleets are identified by rank (strongest-HP-first), not by
 identity, so the network doesn't need to track which specific carrier is
 "fleet 0" across ticks.
 """
@@ -20,7 +27,6 @@ import math
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal, Categorical
 
 from entities import Carrier
 from commander import AICommander
@@ -31,7 +37,11 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'commander_policy
 
 
 class CommanderPolicy(nn.Module):
-    """Small actor-critic MLP. See module docstring for the observation layout."""
+    """Small feed-forward net. See module docstring for the observation layout.
+
+    Outputs, per own fleet slot: a push-fraction logit (sigmoid -> 0..1) and
+    a distribution over which enemy fleet slot to rally toward.
+    """
 
     GLOBAL_FEATS      = 8
     OWN_FLEET_FEATS   = 6
@@ -44,19 +54,15 @@ class CommanderPolicy(nn.Module):
             nn.Linear(self.IN_DIM, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden),      nn.Tanh(),
         )
-        self.push_mean     = nn.Linear(hidden, MAX_FLEETS)
-        self.push_logstd   = nn.Parameter(torch.full((MAX_FLEETS,), -0.5))
-        self.target_logits = nn.Linear(hidden, MAX_FLEETS * MAX_FLEETS)
-        self.value         = nn.Linear(hidden, 1)
+        self.push_logit     = nn.Linear(hidden, MAX_FLEETS)
+        self.target_logits  = nn.Linear(hidden, MAX_FLEETS * MAX_FLEETS)
 
     def forward(self, obs: torch.Tensor):
-        """obs: (batch, IN_DIM) -> push_mean, push_logstd, target_logits (batch,F,F), value (batch,)"""
+        """obs: (batch, IN_DIM) -> push_logit (batch,F), target_logits (batch,F,F)"""
         h = self.backbone(obs)
-        push_mean     = self.push_mean(h)
-        push_logstd   = self.push_logstd.expand_as(push_mean)
+        push_logit    = self.push_logit(h)
         target_logits = self.target_logits(h).view(-1, MAX_FLEETS, MAX_FLEETS)
-        value         = self.value(h).squeeze(-1)
-        return push_mean, push_logstd, target_logits, value
+        return push_logit, target_logits
 
 
 class NeuralCommander:
@@ -71,7 +77,7 @@ class NeuralCommander:
     def __init__(self, team: int, enemy_team: int,
                  own_spawn: tuple[float, float], enemy_spawn: tuple[float, float],
                  world_w: float, world_h: float,
-                 policy: CommanderPolicy | None = None, stochastic: bool = False):
+                 policy: CommanderPolicy | None = None):
         self.team        = team
         self.enemy_team   = enemy_team
         self.own_spawn    = own_spawn
@@ -83,9 +89,6 @@ class NeuralCommander:
         self._elapsed     = 0.0
         self._decision_t  = 0.0
         self._rally: dict = {}   # id(fleet leader) -> (x, y)
-
-        self.stochastic = stochastic     # True during training (sample); False at inference (use mean/argmax)
-        self.trajectory: list = []       # filled only when stochastic=True — consumed by the trainer
 
         # No usable trained weights (fresh checkout, model deleted, file
         # mid-write from a concurrent training run, architecture mismatch,
@@ -130,7 +133,7 @@ class NeuralCommander:
         self._apply(ai_characters)
 
     # ── Deploy trigger — identical heuristic to AICommander, intentionally
-    #    not learned (see plan: cheap and not worth spending training budget on) ──
+    #    not learned (cheap and not worth spending training budget on) ────────
     def _check_deploy(self, ai_characters: list) -> None:
         own = [s for s in ai_characters if s.alive and s.team == self.team]
         if not own:
@@ -147,12 +150,6 @@ class NeuralCommander:
                 s.deployed = True
 
     # ── Strategy ─────────────────────────────────────────────────────────────
-    # Runs gradient-free (the forward pass only needs to produce numbers to
-    # act on). Training recomputes log-probs/entropy/value in one batched,
-    # grad-enabled pass over the recorded (obs, action) pairs afterwards —
-    # see `recompute_batch` below — which is what makes rollout collection
-    # safe to run in parallel worker processes that hold no live autograd
-    # graph at all.
     def _decide(self, ai_characters: list) -> None:
         own_fleets   = self._collect_fleets(ai_characters, self.team)
         enemy_fleets = self._collect_fleets(ai_characters, self.enemy_team)
@@ -160,45 +157,33 @@ class NeuralCommander:
             return
 
         obs = self._build_obs(ai_characters, own_fleets, enemy_fleets)
-        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-
-        with torch.no_grad():
-            push_mean, push_logstd, target_logits, value = self.policy(obs_t)
-        push_mean, push_logstd = push_mean[0], push_logstd[0]
-        target_logits, value   = target_logits[0], value[0]
-
-        n_enemy = len(enemy_fleets)
-        fleet_actions = []   # (z: float, tgt_idx: int|None) per own fleet, in order
+        push_frac_list, target_idx_list = self.infer(obs, len(own_fleets), len(enemy_fleets))
 
         for i, (leader, members) in enumerate(own_fleets):
-            std  = torch.exp(push_logstd[i])
-            dist = Normal(push_mean[i], std)
-            z = dist.sample() if self.stochastic else push_mean[i]
-            push_frac = torch.sigmoid(z)
-
-            target_centroid = None
-            tgt_idx = None
-            if n_enemy > 0:
-                logits = target_logits[i, :n_enemy]
-                if self.stochastic:
-                    tgt_idx = int(Categorical(logits=logits).sample().item())
-                else:
-                    tgt_idx = int(torch.argmax(logits).item())
-                target_centroid = self._fleet_centroid(enemy_fleets[tgt_idx][1])
-
-            fleet_actions.append((float(z.item()), tgt_idx))
-
-            if target_centroid is None:
-                target_centroid = self.enemy_spawn
+            tgt_idx = target_idx_list[i]
+            target_centroid = (self._fleet_centroid(enemy_fleets[tgt_idx][1])
+                                if tgt_idx is not None else self.enemy_spawn)
 
             own_centroid = self._fleet_centroid(members)
-            pf = float(push_frac.item())
+            pf = push_frac_list[i]
             rx = own_centroid[0] + (target_centroid[0] - own_centroid[0]) * pf
             ry = own_centroid[1] + (target_centroid[1] - own_centroid[1]) * pf
             self._rally[id(leader)] = (rx, ry)
 
-        if self.stochastic:
-            self.trajectory.append({'obs': obs, 'fleets': fleet_actions, 'n_enemy': n_enemy})
+    def infer(self, obs: list, n_own: int, n_enemy: int):
+        """Deterministic forward pass -> (push_frac per fleet, target enemy idx per fleet)."""
+        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            push_logit, target_logits = self.policy(obs_t)
+        push_frac = torch.sigmoid(push_logit[0]).tolist()
+
+        target_idx = []
+        for i in range(n_own):
+            if n_enemy > 0:
+                target_idx.append(int(torch.argmax(target_logits[0, i, :n_enemy]).item()))
+            else:
+                target_idx.append(None)
+        return push_frac, target_idx
 
     # ── Execution — identical pattern to AICommander._apply, just per-fleet ──
     def _apply(self, ai_characters: list) -> None:
@@ -304,39 +289,3 @@ class NeuralCommander:
                 feats.extend([0.0, 0.0, 0.0, 0.0, 0.0])
 
         return feats
-
-
-def recompute_batch(policy: CommanderPolicy, ticks: list[dict]):
-    """Re-run `policy` (grad-enabled) over a batch of recorded decision ticks
-    (the raw dicts NeuralCommander.trajectory accumulates) and return
-    (log_probs, entropies, values) each shaped (len(ticks),).
-
-    Used by the trainer to turn gradient-free rollout data — possibly
-    collected in a separate worker process — into a loss against the
-    *current* policy weights in one batched forward pass.
-    """
-    eps = 1e-6
-    obs_t = torch.tensor([t['obs'] for t in ticks], dtype=torch.float32)
-    push_mean, push_logstd, target_logits, values = policy(obs_t)
-
-    log_probs, entropies = [], []
-    for row, t in enumerate(ticks):
-        std_row = torch.exp(push_logstd[row])
-        lp_terms, ent_terms = [], []
-        for i, (z, tgt_idx) in enumerate(t['fleets']):
-            dist = Normal(push_mean[row, i], std_row[i])
-            z_t  = torch.as_tensor(z, dtype=torch.float32)
-            push_frac = torch.sigmoid(z_t)
-            lp = dist.log_prob(z_t) - torch.log(push_frac * (1 - push_frac) + eps)
-            ent = dist.entropy()
-            if tgt_idx is not None:
-                logits = target_logits[row, i, :t['n_enemy']]
-                cat = Categorical(logits=logits)
-                lp  = lp + cat.log_prob(torch.as_tensor(tgt_idx))
-                ent = ent + cat.entropy()
-            lp_terms.append(lp)
-            ent_terms.append(ent)
-        log_probs.append(torch.stack(lp_terms).sum())
-        entropies.append(torch.stack(ent_terms).sum())
-
-    return torch.stack(log_probs), torch.stack(entropies), values

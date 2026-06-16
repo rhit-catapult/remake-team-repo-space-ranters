@@ -1,25 +1,14 @@
 """
-train_commander.py — Self-play trainer for NeuralCommander.
+train_commander.py — Fast imitation-learning trainer for NeuralCommander.
 
-Each round:
-  1. Broadcast the current policy weights to a pool of worker processes.
-  2. Each worker plays one full self-play match headless (both teams share
-     the same weights, gradient-free) and returns the raw decision-tick
-     data plus a terminal reward for each team.
-  3. The main process re-runs the *current* policy over the whole batch of
-     recorded ticks in one shot (recompute_batch) to get gradient-tracked
-     log-probs/entropy/value, then does a single REINFORCE-with-baseline
-     update (policy loss + value loss − entropy bonus).
-
-Checkpoints to models/commander_policy.pt periodically and resumes from it
-automatically, so this is safe to stop (Ctrl+C) and restart at any time.
-Every --eval-every rounds it also plays the *deterministic* policy against
-the rule-based AICommander baseline — self-play reward alone can drift
-without the policy actually getting better, so this is the real progress
-signal.
+Generates realistic game states from fast rule-based-vs-rule-based matches
+(no neural-net overhead during data generation), labels each fleet's ideal
+(push fraction, target fleet) with a richer per-fleet generalisation of
+AICommander's own strength-ratio heuristic, then fits CommanderPolicy to
+reproduce those labels via ordinary supervised learning — minutes, not the
+hours self-play reinforcement learning needed for the same per-fleet
+behaviour.
 """
-import os
-import json
 import random
 import time
 import argparse
@@ -28,204 +17,174 @@ import multiprocessing as mp
 import torch
 import torch.nn.functional as F
 
-from neural_commander import CommanderPolicy, NeuralCommander, recompute_batch, MODEL_PATH
+from neural_commander import CommanderPolicy, NeuralCommander, MAX_FLEETS, MODEL_PATH
 from commander import AICommander
+from main import WORLD_W, WORLD_H, _team_spawn_center
 import headless_sim
 
-TRAIN_STATE_PATH = MODEL_PATH + '.train.json'
+
+def _push_frac_for_ratio(ratio: float) -> float:
+    # Mirrors AICommander._decide's own thresholds — just applied per-fleet
+    # against that fleet's nearest enemy instead of one team-wide ratio.
+    if ratio > 1.15:
+        return 0.95
+    if ratio < 0.45:
+        return 0.10
+    if ratio < 0.75:
+        return 0.35
+    return 0.60
 
 
-def _play_match(state_dict, max_seconds, dt, seed):
+def _teacher_labels(own_fleets, enemy_fleets):
+    """Each fleet reacts to its own local matchup (nearest enemy fleet)
+    instead of one shared team-wide ratio — the per-fleet richness the
+    network is being taught to reproduce. Returns [(push_frac, target_idx)]
+    in the same order as own_fleets; target_idx is None when there's no
+    enemy fleet left to rally toward."""
+    enemy_info = []
+    for _, members in enemy_fleets:
+        cx = sum(s.wx + s.width / 2 for s in members) / len(members)
+        cy = sum(s.wy + s.height / 2 for s in members) / len(members)
+        enemy_info.append((cx, cy, sum(s.hp for s in members)))
+
+    labels = []
+    for _, members in own_fleets:
+        cx = sum(s.wx + s.width / 2 for s in members) / len(members)
+        cy = sum(s.wy + s.height / 2 for s in members) / len(members)
+        own_hp = sum(s.hp for s in members)
+        if enemy_info:
+            nearest_idx = min(range(len(enemy_info)),
+                               key=lambda i: (enemy_info[i][0] - cx) ** 2 + (enemy_info[i][1] - cy) ** 2)
+            ratio = own_hp / max(1.0, enemy_info[nearest_idx][2])
+            labels.append((_push_frac_for_ratio(ratio), nearest_idx))
+        else:
+            labels.append((0.6, None))
+    return labels
+
+
+def _collect_samples(seed: int, max_seconds: float, dt: float):
+    """Play one rule-based-vs-rule-based match, recording (obs, labels) at
+    the same 1Hz decision cadence the real commanders use. Runs gradient-free
+    and NN-free — pure simulation + arithmetic — so this is fast and safe to
+    run in parallel worker processes."""
     random.seed(seed)
-    torch.manual_seed(seed)
-    policy = CommanderPolicy()
-    policy.load_state_dict(state_dict)
-    policy.eval()
+
+    dummy_policy = CommanderPolicy()
+    spawn0, spawn1 = _team_spawn_center(0), _team_spawn_center(1)
+    helper0 = NeuralCommander(team=0, enemy_team=1, own_spawn=spawn0, enemy_spawn=spawn1,
+                               world_w=WORLD_W, world_h=WORLD_H, policy=dummy_policy)
+    helper1 = NeuralCommander(team=1, enemy_team=0, own_spawn=spawn1, enemy_spawn=spawn0,
+                               world_w=WORLD_W, world_h=WORLD_H, policy=dummy_policy)
+
+    samples = []
+    tick_t = [0.0]
+
+    def on_tick(ai_characters, c0, c1):
+        tick_t[0] += dt
+        if tick_t[0] < 1.0:
+            return
+        tick_t[0] = 0.0
+        for commander, helper in ((c0, helper0), (c1, helper1)):
+            if not commander.deployed:
+                continue
+            helper._elapsed = commander._elapsed
+            own_fleets   = helper._collect_fleets(ai_characters, helper.team)
+            enemy_fleets = helper._collect_fleets(ai_characters, helper.enemy_team)
+            if not own_fleets:
+                continue
+            obs    = helper._build_obs(ai_characters, own_fleets, enemy_fleets)
+            labels = _teacher_labels(own_fleets, enemy_fleets)
+            samples.append({'obs': obs, 'labels': labels, 'n_enemy': len(enemy_fleets)})
 
     def factory(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h):
-        return NeuralCommander(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h,
-                                policy=policy, stochastic=True)
-
-    result = headless_sim.run_match(factory, factory, max_seconds=max_seconds, dt=dt)
-    c0, c1 = result['commander0'], result['commander1']
-    count  = result['count']
-    hp_frac = {t: result['hp'][t] / max(1.0, result['initial_max_hp'][t]) for t in (0, 1)}
-
-    reward = {}
-    for t in (0, 1):
-        e = 1 - t
-        r = hp_frac[t] - hp_frac[e]
-        if count[t] == 0 and count[e] > 0:
-            r -= 1.0
-        elif count[e] == 0 and count[t] > 0:
-            r += 1.0
-        reward[t] = r
-
-    win = None
-    if count[0] == 0 and count[1] > 0:
-        win = 1
-    elif count[1] == 0 and count[0] > 0:
-        win = 0
-    elif hp_frac[0] != hp_frac[1]:
-        win = 0 if hp_frac[0] > hp_frac[1] else 1
-
-    return {
-        'ticks0': c0.trajectory, 'reward0': reward[0],
-        'ticks1': c1.trajectory, 'reward1': reward[1],
-        'win': win, 'elapsed': result['elapsed'],
-    }
-
-
-def _eval_match(state_dict, neural_team, max_seconds, dt, seed):
-    """Deterministic NeuralCommander (playing `neural_team`) vs rule-based AICommander."""
-    random.seed(seed)
-    torch.manual_seed(seed)
-    policy = CommanderPolicy()
-    policy.load_state_dict(state_dict)
-    policy.eval()
-
-    def neural_factory(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h):
-        return NeuralCommander(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h,
-                                policy=policy, stochastic=False)
-
-    def rule_factory(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h):
         return AICommander(team, enemy_team, own_spawn, enemy_spawn, world_w, world_h)
 
-    if neural_team == 0:
-        result = headless_sim.run_match(neural_factory, rule_factory, max_seconds=max_seconds, dt=dt)
-    else:
-        result = headless_sim.run_match(rule_factory, neural_factory, max_seconds=max_seconds, dt=dt)
+    headless_sim.run_match(factory, factory, max_seconds=max_seconds, dt=dt, on_tick=on_tick)
+    return samples
 
-    enemy_team = 1 - neural_team
-    count = result['count']
-    hp_frac = {t: result['hp'][t] / max(1.0, result['initial_max_hp'][t]) for t in (0, 1)}
 
-    if count[neural_team] == 0 and count[enemy_team] > 0:
-        return False
-    if count[enemy_team] == 0 and count[neural_team] > 0:
-        return True
-    return hp_frac[neural_team] > hp_frac[enemy_team]
+def generate_dataset(num_matches: int, workers: int, max_seconds: float, dt: float) -> list:
+    seeds = [random.randint(0, 2**31 - 1) for _ in range(num_matches)]
+    jobs  = [(s, max_seconds, dt) for s in seeds]
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(processes=workers) as pool:
+        results = pool.starmap(_collect_samples, jobs)
+    samples = [s for r in results for s in r]
+    return samples
+
+
+def train(samples: list, epochs: int, lr: float) -> CommanderPolicy:
+    n = len(samples)
+    obs_t = torch.tensor([s['obs'] for s in samples], dtype=torch.float32)
+
+    push_label   = torch.zeros(n, MAX_FLEETS)
+    own_mask     = torch.zeros(n, MAX_FLEETS)
+    target_label = torch.zeros(n, MAX_FLEETS, dtype=torch.long)
+    target_mask  = torch.zeros(n, MAX_FLEETS)
+    enemy_valid  = torch.zeros(n, MAX_FLEETS)
+
+    for row, s in enumerate(samples):
+        enemy_valid[row, :s['n_enemy']] = 1.0
+        for i, (pf, tgt) in enumerate(s['labels']):
+            own_mask[row, i]   = 1.0
+            push_label[row, i] = pf
+            if tgt is not None:
+                target_label[row, i] = tgt
+                target_mask[row, i]  = 1.0
+
+    policy    = CommanderPolicy()
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    neg_inf   = -1e9
+
+    for epoch in range(epochs):
+        push_logit, target_logits = policy(obs_t)
+        push_pred  = torch.sigmoid(push_logit)
+        push_loss  = (((push_pred - push_label) ** 2) * own_mask).sum() / own_mask.sum().clamp(min=1)
+
+        masked_logits = target_logits.masked_fill(enemy_valid.unsqueeze(1) == 0, neg_inf)
+        logp     = F.log_softmax(masked_logits, dim=-1)
+        gathered = logp.gather(-1, target_label.unsqueeze(-1)).squeeze(-1)
+        target_loss = -(gathered * target_mask).sum() / target_mask.sum().clamp(min=1)
+
+        loss = push_loss + target_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 20 == 0 or epoch == epochs - 1:
+            print(f"[train] epoch {epoch:4d} | push_loss {push_loss.item():.4f} | "
+                  f"target_loss {target_loss.item():.4f}", flush=True)
+
+    return policy
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--episodes',      type=int,   default=10_000_000)
-    ap.add_argument('--workers',       type=int,   default=max(1, (os.cpu_count() or 4) - 2))
-    ap.add_argument('--batch-episodes', type=int,  default=None)
-    ap.add_argument('--max-seconds',   type=float, default=150.0)
-    ap.add_argument('--dt',            type=float, default=0.05)
-    ap.add_argument('--lr',            type=float, default=3e-4)
-    ap.add_argument('--value-coef',    type=float, default=0.5)
-    ap.add_argument('--entropy-coef',  type=float, default=0.002)
-    ap.add_argument('--eval-every',    type=int,   default=10)
-    ap.add_argument('--eval-matches',  type=int,   default=6)
-    ap.add_argument('--save-every',    type=int,   default=2)
-    ap.add_argument('--no-resume',     action='store_true')
+    ap.add_argument('--matches',     type=int,   default=24)
+    ap.add_argument('--workers',     type=int,   default=12)
+    ap.add_argument('--max-seconds', type=float, default=150.0)
+    ap.add_argument('--dt',          type=float, default=0.05)
+    ap.add_argument('--epochs',      type=int,   default=400)
+    ap.add_argument('--lr',          type=float, default=1e-2)
     args = ap.parse_args()
 
-    batch_episodes = args.batch_episodes or args.workers
+    t0 = time.time()
+    print(f"[train] generating dataset from {args.matches} rule-based-vs-rule-based "
+          f"matches across {args.workers} workers...", flush=True)
+    samples = generate_dataset(args.matches, args.workers, args.max_seconds, args.dt)
+    t1 = time.time()
+    print(f"[train] collected {len(samples)} decision samples in {t1 - t0:.1f}s", flush=True)
 
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    policy = CommanderPolicy()
+    if not samples:
+        print("[train] no samples collected (matches too short to deploy) — aborting")
+        return
 
-    round_idx, episodes_done = 0, 0
-    if not args.no_resume and os.path.exists(MODEL_PATH):
-        policy.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
-        print(f"[train] resumed weights from {MODEL_PATH}")
-        if os.path.exists(TRAIN_STATE_PATH):
-            with open(TRAIN_STATE_PATH) as f:
-                state = json.load(f)
-            round_idx     = state.get('round', 0)
-            episodes_done = state.get('episodes_done', 0)
-            print(f"[train] resumed training state: round {round_idx}, {episodes_done} episodes")
+    policy = train(samples, args.epochs, args.lr)
+    t2 = time.time()
+    print(f"[train] trained {args.epochs} epochs in {t2 - t1:.1f}s", flush=True)
 
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
-
-    ctx  = mp.get_context('spawn')
-    pool = ctx.Pool(processes=args.workers)
-    print(f"[train] {args.workers} worker processes, {batch_episodes} episodes/round, "
-          f"max_seconds={args.max_seconds} dt={args.dt}", flush=True)
-
-    t_start = time.time()
-    win_history: list = []
-
-    def checkpoint():
-        # Atomic write — the live game may load MODEL_PATH from a separate
-        # process at any moment; os.replace() never exposes a partial file.
-        tmp_path = MODEL_PATH + '.tmp'
-        torch.save(policy.state_dict(), tmp_path)
-        os.replace(tmp_path, MODEL_PATH)
-        with open(TRAIN_STATE_PATH, 'w') as f:
-            json.dump({'round': round_idx, 'episodes_done': episodes_done,
-                       'win_history': win_history[-500:]}, f)
-
-    try:
-        while episodes_done < args.episodes:
-            state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
-            seeds = [random.randint(0, 2**31 - 1) for _ in range(batch_episodes)]
-            jobs  = [(state_dict, args.max_seconds, args.dt, s) for s in seeds]
-            results = pool.starmap(_play_match, jobs)
-
-            all_ticks, all_returns = [], []
-            for r in results:
-                if r['ticks0']:
-                    all_ticks.extend(r['ticks0']); all_returns.extend([r['reward0']] * len(r['ticks0']))
-                if r['ticks1']:
-                    all_ticks.extend(r['ticks1']); all_returns.extend([r['reward1']] * len(r['ticks1']))
-                if r['win'] is not None:
-                    win_history.append(r['win'])
-
-            episodes_done += len(results)
-            round_idx += 1
-
-            if not all_ticks:
-                print(f"[train] round {round_idx}: no decision ticks recorded this round "
-                      f"(matches ended before any deploy) — skipping update", flush=True)
-                continue
-
-            log_probs, entropies, values = recompute_batch(policy, all_ticks)
-            returns_t   = torch.tensor(all_returns, dtype=torch.float32)
-            advantage   = returns_t - values.detach()
-            policy_loss = -(log_probs * advantage).mean()
-            value_loss  = F.mse_loss(values, returns_t)
-            entropy_avg = entropies.mean()
-            loss = policy_loss + args.value_coef * value_loss - args.entropy_coef * entropy_avg
-
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optimizer.step()
-
-            mean_return = sum(all_returns) / len(all_returns)
-            recent_wr   = (sum(win_history[-50:]) / len(win_history[-50:])) if win_history else float('nan')
-            wall_min    = (time.time() - t_start) / 60.0
-            print(f"[train] round {round_idx:5d} | episodes {episodes_done:6d} | "
-                  f"loss {loss.item():+.4f} (pi {policy_loss.item():+.4f} v {value_loss.item():.4f} "
-                  f"ent {entropy_avg.item():.3f}) | mean_return {mean_return:+.3f} | "
-                  f"team0_winrate(last50) {recent_wr:.2f} | wall {wall_min:.1f}m", flush=True)
-
-            if round_idx % args.save_every == 0:
-                checkpoint()
-                print(f"[train] checkpoint saved (round {round_idx})", flush=True)
-
-            if round_idx % args.eval_every == 0:
-                eval_state = {k: v.cpu() for k, v in policy.state_dict().items()}
-                eval_jobs = [
-                    (eval_state, i % 2, args.max_seconds, args.dt, random.randint(0, 2**31 - 1))
-                    for i in range(args.eval_matches)
-                ]
-                eval_results = pool.starmap(_eval_match, eval_jobs)
-                win_rate = sum(1 for w in eval_results if w) / len(eval_results)
-                print(f"[train] === eval vs rule-based AICommander: "
-                      f"{win_rate * 100:.0f}% win rate over {len(eval_results)} matches ===", flush=True)
-
-    except KeyboardInterrupt:
-        print("[train] interrupted — saving checkpoint and exiting", flush=True)
-    finally:
-        checkpoint()
-        print(f"[train] final checkpoint: round {round_idx}, {episodes_done} episodes", flush=True)
-        pool.close()
-        pool.join()
+    torch.save(policy.state_dict(), MODEL_PATH)
+    print(f"[train] saved weights to {MODEL_PATH} (total wall time {t2 - t0:.1f}s)", flush=True)
 
 
 if __name__ == '__main__':
