@@ -539,14 +539,17 @@ class AICharacter(Entity):
             self._movement_override = self._calc_intercept_pos(cx, cy, best_target)
 
         # ── Fleet cohesion: pull back if combat has dragged us too far ────
-        if (self.fleet_leader is not None and self.fleet_leader is not self
-                and self.fleet_leader.alive):
-            lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
-            lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
-            slot_x = lcx + self.fleet_offset[0]
-            slot_y = lcy + self.fleet_offset[1]
-            if math.hypot(cx - slot_x, cy - slot_y) > self.fleet_stray_dist:
-                self._movement_override = (slot_x, slot_y)
+        if not self._should_hold_fire_course():
+            if (self.fleet_leader is not None and self.fleet_leader is not self
+                    and self.fleet_leader.alive):
+                lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
+                lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
+                slot_x = lcx + self.fleet_offset[0]
+                slot_y = lcy + self.fleet_offset[1]
+                if math.hypot(cx - slot_x, cy - slot_y) > self.fleet_stray_dist:
+                    self._movement_override = (slot_x, slot_y)
+            elif self.fleet_leader is not None and not self.fleet_leader.alive:
+                self.fleet_leader = None
         elif self.fleet_leader is not None and not self.fleet_leader.alive:
             self.fleet_leader = None
 
@@ -615,6 +618,13 @@ class AICharacter(Entity):
         else:
             dx, dy = 1.0, 0.0
         return (cx + dx * 900, cy + dy * 900)
+
+    def _should_hold_fire_course(self) -> bool:
+        """Return True while the destroyer is locking a target and should ignore course correction."""
+        return (isinstance(self, Destroyer)
+                and self._current_target is not None
+                and self._charge > 0.0
+                and self._cooldown <= 0.0)
 
     def _aim_and_fire(self, dt: float, cx: float, cy: float,
                       all_ships: list, lasers: list) -> None:
@@ -1397,11 +1407,11 @@ class Destroyer(AICharacter):
     vulnerable when caught out of position or circled by fast frigates.
     """
 
-    CHARGE_TIME   = 5.0    # seconds of continuous aim-lock required to fire
-    COOLDOWN_TIME = 3.5    # mandatory cooldown after firing before charge can restart
-    CANNON_RANGE  = 1400.0 # world units — long-range sniper reach
-    CANNON_ARC    = 0.10   # half firing arc in radians (~5.7°)
-    CANNON_DAMAGE = 200    # one-shots any capital ship
+    CHARGE_TIME   = 1.0         # seconds of continuous aim-lock required to fire
+    COOLDOWN_TIME = 4.0         # shorter cooldown; total cycle is roughly 3x less frequent than other ships
+    CANNON_RANGE  = ATTACK_RANGE * 6.0  # world units — three times the range of standard ships
+    CANNON_ARC    = 0.10        # half firing arc in radians (~5.7°)
+    CANNON_DAMAGE = 200         # one-shots any capital ship
 
     def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
         w = random.randint(130, 165)
