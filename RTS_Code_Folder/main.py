@@ -34,7 +34,8 @@ import random
 import threading
 import pygame
 from camera import Camera
-from entities import AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer
+from entities import (AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer,
+                      Star, Planet, Constructor)
 from commander import AICommander
 from neural_commander import NeuralCommander
 
@@ -42,7 +43,7 @@ from neural_commander import NeuralCommander
 SCREEN_W, SCREEN_H = 1000, 800
 
 # ── World ─────────────────────────────────────────────────────────────────────
-map_scale_factor = 4
+map_scale_factor = 6
 WORLD_W = 4000 * map_scale_factor
 WORLD_H = 3200 * map_scale_factor
 
@@ -164,7 +165,12 @@ def run_loading_screen(screen, clock, player_team):
 
         state['step']     = 'Deploying fleets…'
         state['progress'] = 0.60
-        state['ai_characters'] = setup_game()
+        result = setup_game()
+        if isinstance(result, tuple):
+            state['ai_characters'], state['solar_entities'] = result
+        else:
+            state['ai_characters'] = result
+            state['solar_entities'] = []
 
         state['step']     = 'Forming battle groups…'
         state['progress'] = 0.92
@@ -204,7 +210,7 @@ def run_loading_screen(screen, clock, player_team):
         pygame.display.flip()
 
     t.join()
-    return state['world_surf'], state['ai_characters']
+    return state['world_surf'], state['ai_characters'], state['solar_entities']
 
 
 # ── Menu ──────────────────────────────────────────────────────────────────────
@@ -433,58 +439,93 @@ def _make_waypoints(team=None):
     return [spawn] + rest
 
 
+def _team_star_position(team):
+    if team == 0:
+        return (6000, 6000)  # Top-left corner
+    else:
+        return (18000, 13200)  # Bottom-right corner
+
+
+def _build_solar_system(team):
+    star_x, star_y = _team_star_position(team)
+    star = Star(star_x, star_y, radius=525, color=TEAM_COLORS[team])
+    planet_types = ['home', 'rocky', 'water', 'gas', 'rocky', 'water', 'gas']
+    orbit_radii = [1350, 1950, 2550, 3150, 3750, 4350, 4950]
+    planets = []
+    for i, planet_type in enumerate(planet_types):
+        angle = random.uniform(0, math.tau)
+        speed = 0.020 - i * 0.0025  # innermost fastest, outermost slowest
+        radius = 195 if planet_type == 'rocky' else 225 if planet_type == 'water' else 300
+        if planet_type == 'home':
+            radius = 270
+        planets.append(
+            Planet(star_x, star_y, orbit_radii[i], angle, speed,
+                   planet_type, team, radius)
+        )
+    home_planet = next(p for p in planets if p.planet_type == 'home')
+    constructor = Constructor(home_planet, orbit_radius=home_planet.orbit_radius,
+                              angle=home_planet.angle + math.pi,
+                              team=team, orbit_speed=home_planet.orbit_speed)
+    return [star] + planets + [constructor]
+
+
 def setup_game():
-    NUM_CARRIERS_PER_TEAM  = max(1, NUM_AI // 25)
-    NUM_DESTROYERS_PER_TEAM = 2
+    solar_entities = []
+    constructors = {}
+    for team in (0, 1):
+        solar_team = _build_solar_system(team)
+        solar_entities.extend(solar_team)
+        constructor = next((e for e in solar_team if isinstance(e, Constructor)), None)
+        if constructor:
+            constructors[team] = constructor
 
+    # Spawn initial fleets from constructors
     ai_characters = []
-    for i in range(NUM_AI):
-        team      = 0 if i < NUM_AI // 2 else 1
-        team_slot = i if team == 0 else i - NUM_AI // 2
-        wp        = _make_waypoints(team)
-        if team_slot < NUM_CARRIERS_PER_TEAM:
-            ai_characters.append(Carrier(wp[0][0], wp[0][1], wp, team=team))
-        else:
-            ai_characters.append(AICharacter(wp[0][0], wp[0][1], wp, team=team))
-
     for team in (0, 1):
-        team_carriers = [s for s in ai_characters
-                         if isinstance(s, Carrier) and s.team == team]
-        for i in range(NUM_DESTROYERS_PER_TEAM):
-            wp = _make_waypoints(team)
-            d  = Destroyer(wp[0][0], wp[0][1], wp, team=team)
-            if team_carriers:
-                leader = team_carriers[i % len(team_carriers)]
-                d.fleet_leader     = leader
-                d.fleet_offset     = (0.0, (1 if i % 2 == 0 else -1) * 550.0)
-                d.fleet_stray_dist = 900.0
-            ai_characters.append(d)
-
-    ESCORTS_PER_FLEET = 3
-    for team in (0, 1):
-        carriers  = [s for s in ai_characters if isinstance(s, Carrier) and s.team == team]
-        non_carry = [s for s in ai_characters
-                     if not isinstance(s, Carrier) and s.team == team]
-        if not carriers:
+        if team not in constructors:
             continue
-        for carrier in carriers:
-            carrier.fleet_leader = carrier
-        for i, ship in enumerate(non_carry):
-            leader     = carriers[i % len(carriers)]
-            fleet_slot = i // len(carriers)
-            ship.fleet_leader = leader
-            if fleet_slot < ESCORTS_PER_FLEET:
-                angle  = fleet_slot * (math.tau / ESCORTS_PER_FLEET)
-                radius = 260
-                ship.fleet_stray_dist = 380
-                ship.role = 'attacker'
-            else:
-                slot   = fleet_slot - ESCORTS_PER_FLEET
-                angle  = slot * 2.39996
-                radius = 300 + (slot % 4) * 130
-            ship.fleet_offset = (math.cos(angle) * radius, math.sin(angle) * radius)
+        constructor = constructors[team]
+        cx = constructor.wx + constructor.radius
+        cy = constructor.wy + constructor.radius
 
-    return ai_characters
+        # Initial fleet: 1 carrier + 2 destroyers + 6 frigates
+        wp_carrier = _make_waypoints(team)
+        carrier = Carrier(cx, cy, wp_carrier, team=team)
+        carrier.wx -= carrier.width / 2
+        carrier.wy -= carrier.height / 2
+        carrier.deployed = False
+        carrier.home_pos = (carrier.wx + carrier.width / 2, carrier.wy + carrier.height / 2)
+        carrier.fleet_leader = carrier
+        ai_characters.append(carrier)
+
+        for d_idx in range(2):
+            wp_destroyer = _make_waypoints(team)
+            destroyer = Destroyer(cx + (d_idx - 0.5) * 100, cy + 80, wp_destroyer, team=team)
+            destroyer.wx -= destroyer.width / 2
+            destroyer.wy -= destroyer.height / 2
+            destroyer.deployed = False
+            destroyer.home_pos = (destroyer.wx + destroyer.width / 2,
+                                   destroyer.wy + destroyer.height / 2)
+            destroyer.fleet_leader = carrier
+            destroyer.fleet_offset = (0.0, (1 if d_idx % 2 == 0 else -1) * 550.0)
+            destroyer.fleet_stray_dist = 900.0
+            ai_characters.append(destroyer)
+
+        for f_idx in range(6):
+            wp_frigate = _make_waypoints(team)
+            frigate = AICharacter(cx - 150 + (f_idx % 3) * 100,
+                                  cy + 150 + (f_idx // 3) * 100,
+                                  wp_frigate, team=team)
+            frigate.deployed = False
+            frigate.home_pos = (frigate.wx + frigate.width / 2, frigate.wy + frigate.height / 2)
+            frigate.fleet_leader = carrier
+            angle = (f_idx * (math.tau / 6))
+            radius = 280
+            frigate.fleet_offset = (math.cos(angle) * radius, math.sin(angle) * radius)
+            frigate.fleet_stray_dist = 450
+            ai_characters.append(frigate)
+
+    return ai_characters, solar_entities
 
 
 # ── Team strategy (fleet-level "commander" layer) ───────────────────────────
@@ -767,17 +808,20 @@ def main():
     player_team = run_menu(screen, clock)
 
     # ── Loading screen → world + entities built in background thread ──────────
-    world_surf, ai_characters = run_loading_screen(screen, clock, player_team)
+    world_surf, ai_characters, solar_entities = run_loading_screen(screen, clock, player_team)
     camera = Camera(SCREEN_W, SCREEN_H)
     lasers:     list[Laser]     = []
     explosions: list[Explosion] = []
 
-    # Start camera centred on the player team's first carrier
+    # Start camera centred on the player team's first carrier, or the home star.
     own_carriers = [s for s in ai_characters
                     if isinstance(s, Carrier) and s.team == player_team]
     if own_carriers:
         c = own_carriers[0]
         camera.follow(c.wx + c.width / 2, c.wy + c.height / 2)
+    else:
+        sx, sy = _team_star_position(player_team)
+        camera.follow(sx, sy)
 
     # ── Enemy commander: trained neural network controlling the other team's
     #    fleet (falls back to the rule-based AICommander if no trained
@@ -825,6 +869,9 @@ def main():
         if vp_rect.width > 0 and vp_rect.height > 0:
             region = world_surf.subsurface(vp_rect)
             pygame.transform.scale(region, (screen_w, screen_h), screen)
+
+        for entity in solar_entities:
+            entity.draw(screen, camera)
 
         for ship in ai_characters:
             ship.draw(screen, camera)
@@ -1065,6 +1112,27 @@ def main():
             resume_button = _draw_quit_confirm(screen, elapsed, (mx, my))
             pygame.display.flip()
             continue
+
+        # ── Solar-system update: stars, planets, constructors
+        built_ships = []
+        for entity in solar_entities:
+            result = entity.update(dt)
+            if result is not None:
+                build_type, sx, sy, team = result
+                wp = _make_waypoints(team)
+                if build_type == 'Carrier':
+                    ship = Carrier(sx, sy, wp, team=team)
+                elif build_type == 'Destroyer':
+                    ship = Destroyer(sx, sy, wp, team=team)
+                else:
+                    ship = AICharacter(sx, sy, wp, team=team)
+                ship.wx -= ship.width / 2
+                ship.wy -= ship.height / 2
+                ship.deployed = False
+                ship.home_pos = (ship.wx + ship.width / 2, ship.wy + ship.height / 2)
+                built_ships.append(ship)
+        if built_ships:
+            ai_characters.extend(built_ships)
 
         # ── Update ────────────────────────────────────────────────────────────
         for ship in ai_characters:

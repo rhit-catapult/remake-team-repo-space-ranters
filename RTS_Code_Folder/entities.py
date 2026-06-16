@@ -55,6 +55,146 @@ class Player(Entity):
             pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 2)
 
 
+class Star(Entity):
+    """A team-coloured star at the centre of a solar system."""
+
+    def __init__(self, cx: float, cy: float, radius: int, color):
+        super().__init__(cx - radius, cy - radius, radius * 2, radius * 2, color)
+        self.cx = cx
+        self.cy = cy
+        self.radius = radius
+
+    def update(self, dt: float):
+        pass
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not camera.is_visible(self.world_rect):
+            return
+        sx, sy = camera.world_to_screen(self.cx, self.cy)
+        r = max(1, int(self.radius * camera.zoom))
+        glow = max(0, min(80, int(14 * camera.zoom)))
+        pygame.draw.circle(surface,
+                           tuple(min(255, c + glow) for c in self.color),
+                           (sx, sy), r + 4)
+        pygame.draw.circle(surface, self.color, (sx, sy), r)
+
+
+class Planet(Entity):
+    """A planet orbiting a star."""
+
+    _PLANET_COLORS = {
+        'rocky': (170, 145, 115),
+        'water': (90, 150, 240),
+        'gas':   (220, 180, 100),
+    }
+    _HOME_COLORS = [(120, 190, 255), (255, 150, 150)]
+
+    def __init__(self, star_x: float, star_y: float, orbit_radius: float,
+                 angle: float, orbit_speed: float, planet_type: str,
+                 team: int, radius: int):
+        self.star_x = star_x
+        self.star_y = star_y
+        self.orbit_radius = orbit_radius
+        self.angle = angle
+        self.orbit_speed = orbit_speed
+        self.planet_type = planet_type
+        self.team = team
+        self.radius = radius
+        color = self._HOME_COLORS[team] if planet_type == 'home' else self._PLANET_COLORS[planet_type]
+        super().__init__(star_x + math.cos(angle) * orbit_radius - radius,
+                         star_y + math.sin(angle) * orbit_radius - radius,
+                         radius * 2, radius * 2, color)
+
+    def update(self, dt: float):
+        self.angle = (self.angle + self.orbit_speed * dt) % math.tau
+        self.wx = self.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
+        self.wy = self.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        sx, sy = camera.world_to_screen(self.star_x, self.star_y)
+        orbit_r = int(self.orbit_radius * camera.zoom)
+        if orbit_r > 2:
+            pygame.draw.circle(surface, (80, 80, 90), (sx, sy), orbit_r, 1)
+
+        if not camera.is_visible(self.world_rect):
+            return
+
+        cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
+        r = max(1, int(self.radius * camera.zoom))
+        pygame.draw.circle(surface, self.color, (cx, cy), r)
+        if self.planet_type == 'gas':
+            pygame.draw.circle(surface, (255, 255, 255), (cx, cy), r, 1)
+
+
+class Constructor(Entity):
+    """Ship constructor orbiting the home planet."""
+
+    _BUILD_ORDER = ['Carrier', 'Destroyer', 'AICharacter', 'AICharacter']
+    _COLORS = [(180, 220, 255), (255, 180, 180)]
+
+    def __init__(self, home_planet: Planet, orbit_radius: float,
+                 angle: float, team: int, orbit_speed: float = 0.9):
+        self.home_planet = home_planet
+        self.team = team
+        self.orbit_radius = orbit_radius
+        self.angle = angle
+        self.orbit_speed = orbit_speed
+        self.build_timer = 5.0
+        self.build_interval = 9.0
+        self.built_count = 0
+        radius = 18
+        color = self._COLORS[team]
+        super().__init__(home_planet.star_x + math.cos(angle) * orbit_radius - radius,
+                         home_planet.star_y + math.sin(angle) * orbit_radius - radius,
+                         radius * 2, radius * 2, color)
+        self.radius = radius
+
+    def update(self, dt: float):
+        self.angle = (self.angle + self.orbit_speed * dt) % math.tau
+        self.wx = self.home_planet.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
+        self.wy = self.home_planet.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
+
+        self.build_timer -= dt
+        if self.build_timer <= 0.0:
+            self.build_timer += self.build_interval
+            build_type = self._select_build_type()
+            self.built_count += 1
+            return (build_type,
+                    self.wx + self.radius,
+                    self.wy + self.radius,
+                    self.team)
+        return None
+
+    def _select_build_type(self) -> str:
+        if self.built_count == 0:
+            return 'Carrier'
+        if self.built_count == 1:
+            return 'Destroyer'
+        return self._BUILD_ORDER[self.built_count % len(self._BUILD_ORDER)]
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not camera.is_visible(self.world_rect):
+            return
+        cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
+        r = max(2, int(self.radius * camera.zoom))
+        pygame.draw.circle(surface, self.color, (cx, cy), r)
+        pygame.draw.circle(surface, (255, 255, 255), (cx, cy), r, 1)
+
+        # Build progress ring
+        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
+        if progress > 0.0:
+            end_angle = progress * math.tau
+            steps = 18
+            points = []
+            for i in range(steps + 1):
+                a = end_angle * i / steps
+                px = cx + math.cos(a) * (r + 6)
+                py = cy + math.sin(a) * (r + 6)
+                points.append((px, py))
+            if len(points) >= 2:
+                pygame.draw.lines(surface, (255, 255, 100), False, points, 2)
+
+
 # Team colour palettes: index 0 = team 0 (blue), index 1 = team 1 (red)
 _TEAM_COLORS = [
     [(60, 140, 255), (80, 180, 255), (40, 100, 220)],   # Team 0 — blues
@@ -271,15 +411,15 @@ class AICharacter(Entity):
                  team: int = 0, _w: int = None, _h: int = None):
         if _w is not None:
             w, h = _w, _h
-            big  = w >= 88
+            big  = w >= 66
         else:
             big = random.random() > 0.5
             if big:
-                w = random.randint(88, 144)
-                h = random.randint(40, 72)
+                w = random.randint(66, 108)
+                h = random.randint(30, 54)
             else:
-                w = random.randint(48, 80)
-                h = random.randint(24, 40)
+                w = random.randint(36, 60)
+                h = random.randint(18, 30)
 
         color = random.choice(_TEAM_COLORS[team])
         super().__init__(wx, wy, w, h, color)
@@ -1039,8 +1179,8 @@ class Fighter(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int, home_carrier=None):
-        w = random.randint(20, 30)
-        h = random.randint(10, 16)
+        w = random.randint(15, 22)
+        h = random.randint(7, 12)
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override all stats — fighters are extreme in every direction
@@ -1246,8 +1386,8 @@ class Carrier(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int):
-        w = random.randint(320, 400)
-        h = random.randint(130, 170)
+        w = random.randint(240, 300)
+        h = random.randint(97, 127)
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override stats: slow, tanky, light AA armament
@@ -1541,8 +1681,8 @@ class Destroyer(AICharacter):
     CANNON_DAMAGE = 200         # one-shots any capital ship
 
     def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
-        w = random.randint(130, 165)
-        h = random.randint(45,  62)
+        w = random.randint(97, 123)
+        h = random.randint(33, 46)
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         self.max_speed  = random.uniform(220, 310)
