@@ -252,6 +252,13 @@ class AICharacter(Entity):
     team_focus_fleet:    dict = {0: None, 1: None}  # team -> enemy fleet_leader to mass fire on
     REGROUP_ALLY_RADIUS = 700.0   # consider a ship "isolated" with no allies within this range
 
+    # World bounds — overwritten by main.py once the map size is known, so
+    # edge-avoidance and "cornered" detection share the game's real dimensions.
+    WORLD_W = 16000.0
+    WORLD_H = 12800.0
+    EDGE_MARGIN   = 600.0   # start steering away from a wall this far out
+    CORNER_MARGIN = 300.0   # this close to a wall with an enemy nearby = no room left to flee
+
     # Turret local positions as (lx_frac, ly_frac) — fractions of half-width / half-height.
     # Applied after rotating by the ship angle, so turrets move with the hull.
     _TURRET_LAYOUTS = {
@@ -358,6 +365,12 @@ class AICharacter(Entity):
         # Player command state — set/cleared by main.py in response to player orders
         self.player_hold = False   # True: hold this exact spot (still aims/fires)
         self.hold_fire   = False   # True: weapons disabled regardless of targets in range
+
+        # Deployment — both teams start parked at their spawn and hold there
+        # (still fight back if attacked) until their commander — the player
+        # via orders, or the AICommander via a fleet-wide push — deploys them.
+        self.deployed = False
+        self.home_pos = (wx + self.width / 2, wy + self.height / 2)
 
     @property
     def target(self) -> tuple[float, float]:
@@ -554,7 +567,9 @@ class AICharacter(Entity):
             else:
                 if self.fleet_leader is not None and not self.fleet_leader.alive:
                     self.fleet_leader = None   # leader destroyed — go independent
-                self._movement_override = None
+                # Not yet deployed: hold at the spawn point instead of
+                # wandering off to a random patrol waypoint.
+                self._movement_override = None if self.deployed else self.home_pos
             return
 
         # ── Positional tactics: don't let lone ships overextend ───────────
@@ -642,8 +657,24 @@ class AICharacter(Entity):
 
         return (ex + px * FLANK_OFFSET, ey + py * FLANK_OFFSET)
 
+    def _edge_push(self, cx: float, cy: float) -> tuple[float, float]:
+        """Repulsion vector pushing away from nearby world-boundary walls,
+        scaled 0→1 by how deep into the margin the ship has drifted."""
+        push_x = push_y = 0.0
+        if cx < self.EDGE_MARGIN:
+            push_x += (self.EDGE_MARGIN - cx) / self.EDGE_MARGIN
+        elif cx > self.WORLD_W - self.EDGE_MARGIN:
+            push_x -= (self.EDGE_MARGIN - (self.WORLD_W - cx)) / self.EDGE_MARGIN
+        if cy < self.EDGE_MARGIN:
+            push_y += (self.EDGE_MARGIN - cy) / self.EDGE_MARGIN
+        elif cy > self.WORLD_H - self.EDGE_MARGIN:
+            push_y -= (self.EDGE_MARGIN - (self.WORLD_H - cy)) / self.EDGE_MARGIN
+        return push_x, push_y
+
     def _calc_retreat_pos(self, cx: float, cy: float, all_ships: list) -> tuple[float, float]:
-        """Return a flee destination directly away from the nearest enemy."""
+        """Return a flee destination directly away from the nearest enemy,
+        curved off nearby walls — or, if pinned in a corner with no room
+        left to run, a charge straight at that enemy as a last-ditch ram."""
         nearest_enemy = None
         nearest_dist  = float('inf')
         for ship in all_ships:
@@ -667,6 +698,22 @@ class AICharacter(Entity):
             dx, dy = dx / d, dy / d
         else:
             dx, dy = 1.0, 0.0
+
+        # Cornered: a wall is right behind us and the enemy is already close
+        # enough that there's no time to route around it — going down
+        # fighting beats being picked apart while pinned, so ram the threat.
+        dist_to_edge = min(cx, cy, self.WORLD_W - cx, self.WORLD_H - cy)
+        if dist_to_edge < self.CORNER_MARGIN and nearest_dist < self.attack_range * 1.3:
+            self.combat_state = 'engage'
+            return (ex, ey)
+
+        # Otherwise curve the flee heading off nearby walls so retreating
+        # ships bend back toward open space instead of running into one.
+        push_x, push_y = self._edge_push(cx, cy)
+        fx, fy = dx + push_x, dy + push_y
+        fmag = math.hypot(fx, fy)
+        if fmag > 0:
+            dx, dy = fx / fmag, fy / fmag
         return (cx + dx * 900, cy + dy * 900)
 
     def _should_hold_fire_course(self) -> bool:
@@ -1286,10 +1333,20 @@ class Carrier(AICharacter):
             d = math.hypot(dx, dy)
             if d > 0:
                 dx, dy = dx / d, dy / d
+            # Curve the flee heading off nearby walls — carriers never
+            # charge, so without this they just pin themselves to the edge.
+            push_x, push_y = self._edge_push(cx, cy)
+            fx, fy = dx + push_x, dy + push_y
+            fmag = math.hypot(fx, fy)
+            if fmag > 0:
+                dx, dy = fx / fmag, fy / fmag
             self._movement_override = (cx + dx * 700, cy + dy * 700)
         else:
             self.combat_state       = 'patrol'
-            self._movement_override = None
+            # Not yet deployed: hold at the spawn point. Once deployed and
+            # no threat nearby, leave the override clear so the commander's
+            # rally-point order (applied after update_combat) takes effect.
+            self._movement_override = None if self.deployed else self.home_pos
 
         # AA guns fire at enemies that get within AA_RANGE
         self._aim_and_fire(dt, cx, cy, all_ships, lasers)

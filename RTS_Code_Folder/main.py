@@ -4,6 +4,11 @@ main.py — Space Ranters: RTS fleet commander.
 Main Menu  → choose Blue or Red team.
 In-game    → command your fleet to destroy the enemy.
 
+Both fleets start parked at opposite ends of the map and hold there (still
+firing back if attacked) until ordered out: your ships deploy the moment you
+give them an order, while the enemy fleet is commanded by an adaptive AI
+that decides for itself when and how hard to commit (see commander.py).
+
 Controls (in-game):
   LMB click        — select a friendly ship
   LMB drag         — box-select multiple ships
@@ -30,6 +35,7 @@ import threading
 import pygame
 from camera import Camera
 from entities import AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer
+from commander import AICommander
 
 # ── Display ───────────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1000, 800
@@ -38,6 +44,9 @@ SCREEN_W, SCREEN_H = 1000, 800
 map_scale_factor = 4
 WORLD_W = 4000 * map_scale_factor
 WORLD_H = 3200 * map_scale_factor
+
+AICharacter.WORLD_W = WORLD_W
+AICharacter.WORLD_H = WORLD_H
 
 FPS      = 60
 NUM_AI   = 100
@@ -400,9 +409,27 @@ def run_menu(screen, clock):
 
 
 # ── Game setup ────────────────────────────────────────────────────────────────
-def _make_waypoints():
-    return [(random.randint(200, WORLD_W - 200),
-             random.randint(200, WORLD_H - 200)) for _ in range(5)]
+SPAWN_SIDE_FRAC = 0.15   # team 0 spawns this far from the left edge, team 1 from the right
+
+
+def _team_spawn_center(team):
+    """Fixed spawn anchor for a team — team 0 always starts on the west side
+    of the map, team 1 always on the east side, regardless of which one the
+    player picked, so the two fleets always open on opposite sides."""
+    frac = SPAWN_SIDE_FRAC if team == 0 else 1.0 - SPAWN_SIDE_FRAC
+    return (WORLD_W * frac, WORLD_H * 0.5)
+
+
+def _make_waypoints(team=None):
+    if team is None:
+        return [(random.randint(200, WORLD_W - 200),
+                 random.randint(200, WORLD_H - 200)) for _ in range(5)]
+    cx, cy = _team_spawn_center(team)
+    spawn = (max(200, min(WORLD_W - 200, cx + random.uniform(-500, 500))),
+             max(200, min(WORLD_H - 200, cy + random.uniform(-1600, 1600))))
+    rest  = [(random.randint(200, WORLD_W - 200),
+              random.randint(200, WORLD_H - 200)) for _ in range(4)]
+    return [spawn] + rest
 
 
 def setup_game():
@@ -413,7 +440,7 @@ def setup_game():
     for i in range(NUM_AI):
         team      = 0 if i < NUM_AI // 2 else 1
         team_slot = i if team == 0 else i - NUM_AI // 2
-        wp        = _make_waypoints()
+        wp        = _make_waypoints(team)
         if team_slot < NUM_CARRIERS_PER_TEAM:
             ai_characters.append(Carrier(wp[0][0], wp[0][1], wp, team=team))
         else:
@@ -423,7 +450,7 @@ def setup_game():
         team_carriers = [s for s in ai_characters
                          if isinstance(s, Carrier) and s.team == team]
         for i in range(NUM_DESTROYERS_PER_TEAM):
-            wp = _make_waypoints()
+            wp = _make_waypoints(team)
             d  = Destroyer(wp[0][0], wp[0][1], wp, team=team)
             if team_carriers:
                 leader = team_carriers[i % len(team_carriers)]
@@ -705,6 +732,15 @@ def main():
         c = own_carriers[0]
         camera.follow(c.wx + c.width / 2, c.wy + c.height / 2)
 
+    # ── Enemy commander: strategic AI controlling the other team's fleet ──────
+    enemy_team = 1 - player_team
+    commander  = AICommander(
+        team=enemy_team, enemy_team=player_team,
+        own_spawn=_team_spawn_center(enemy_team),
+        enemy_spawn=_team_spawn_center(player_team),
+        world_w=WORLD_W, world_h=WORLD_H,
+    )
+
     # ── RTS state ─────────────────────────────────────────────────────────────
     selected_ships: list = []
     # player_orders: id(ship) → [order, ...] queue. order = {'ship_ref', 'type', ...}
@@ -880,6 +916,7 @@ def main():
                     cen_y = sum(cys) / len(cys)
 
                     for s, scx, scy in zip(selected_ships, cxs, cys):
+                        s.deployed = True   # ordered out — no longer idling at spawn
                         if target_enemy is not None:
                             order = {'ship_ref': s, 'type': 'attack', 'target': target_enemy}
                         elif target_ally is not None:
@@ -919,12 +956,18 @@ def main():
         # ── Update ────────────────────────────────────────────────────────────
         for ship in ai_characters:
             ship.update(dt)
+            ship.wx = max(0.0, min(WORLD_W - ship.width,  ship.wx))
+            ship.wy = max(0.0, min(WORLD_H - ship.height, ship.wy))
 
         update_team_strategy(ai_characters)
 
         alive_before = {id(s): s.alive for s in ai_characters}
         for ship in ai_characters:
             ship.update_combat(dt, ai_characters, lasers)
+
+        # Enemy commander — decides when its fleet deploys and where it
+        # rallies, then steers idle ("patrol") fleet leaders toward that order.
+        commander.update(dt, ai_characters)
 
         # Apply player orders — override combat AI's movement destination.
         # Each ship has a queue; the head order is "current" and advances
@@ -1008,6 +1051,7 @@ def main():
                     wp      = _make_waypoints()
                     fighter = Fighter(fx, fy, wp, fteam, home_carrier=ship)
                     fighter.fleet_leader = ship
+                    fighter.deployed     = True   # launched into action, not idling
                     angle = random.uniform(0, math.tau)
                     fighter.fleet_offset = (math.cos(angle) * 200, math.sin(angle) * 200)
                     ship._active_fighters.append(fighter)
