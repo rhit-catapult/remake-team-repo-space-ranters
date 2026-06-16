@@ -278,6 +278,7 @@ class AICharacter(Entity):
         self.angle               = random.uniform(0, math.tau)
         self._thrusting          = False
         self._dampening          = False
+        self._lat_vel            = 0.0  # lateral velocity (perpendicular to heading) for side thrusters
         self._thruster_particles = []   # [wx, wy, vx, vy, age, max_age, r0, kind]
 
         # ── Per-ship stats scaled by size class ───────────────────────────
@@ -391,11 +392,17 @@ class AICharacter(Entity):
             target_angle = math.atan2(dy, dx)
             self._turn_toward(target_angle, dt)
 
-            decel = self.DECEL_DIST if self._movement_override is None else self.DECEL_DIST * 0.55
-            if dist < decel:
-                desired_speed = self.max_speed * (dist / decel)
-                self._dampening = True
+            if self._movement_override is None:
+                # Waypoint travel: smooth decel on approach to a fixed point
+                if dist < self.DECEL_DIST:
+                    desired_speed = self.max_speed * (dist / self.DECEL_DIST)
+                    self._dampening = True
+                else:
+                    desired_speed = self.max_speed
+                    self._thrusting = True
             else:
+                # Combat override: always full thrust — the target point moves every
+                # frame so a decel zone would oscillate desired speed each frame
                 desired_speed = self.max_speed
                 self._thrusting = True
 
@@ -404,13 +411,16 @@ class AICharacter(Entity):
         else:
             desired_vx, desired_vy = 0.0, 0.0
 
-        # Smoothly steer velocity toward the desired value — prevents jerking
-        # when targets change or the ship is mid-turn
-        t = min(1.0, 9.0 * dt)
+        # Smoothly steer velocity toward the desired value
+        t = min(1.0, 6.0 * dt)
         self.vx += (desired_vx - self.vx) * t
         self.vy += (desired_vy - self.vy) * t
 
-        # Apply separation impulse (brief push; velocity resets next frame)
+        # Apply separation impulse — cap so clustered ships can't spike huge combined forces
+        sep_mag = math.hypot(self._sep_ax, self._sep_ay)
+        if sep_mag > 120.0:
+            self._sep_ax *= 120.0 / sep_mag
+            self._sep_ay *= 120.0 / sep_mag
         self.vx += self._sep_ax * dt
         self.vy += self._sep_ay * dt
         self._sep_ax = 0.0
@@ -422,6 +432,17 @@ class AICharacter(Entity):
             f = self.max_speed * 1.4 / speed
             self.vx *= f
             self.vy *= f
+
+        # Side thrusters cancel lateral drift (velocity perpendicular to ship heading)
+        # right-hand perpendicular of heading: (sin_a, -cos_a)
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        v_lat = self.vx * sin_a - self.vy * cos_a   # + = drifting right of heading
+        SIDE_DAMP = 2.5                              # gentle — avoids overcorrection oscillation
+        remove = v_lat * min(1.0, SIDE_DAMP * dt)
+        self.vx -= remove * sin_a
+        self.vy += remove * cos_a
+        self._lat_vel = v_lat
 
         self.wx += self.vx * dt
         self.wy += self.vy * dt
@@ -703,32 +724,33 @@ class AICharacter(Entity):
 
         sp = math.hypot(self.vx, self.vy)
 
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+
         if self._thrusting and sp > 5.0:
-            # Exhaust streams opposite to the velocity vector (retrograde)
-            retro_x = -self.vx / sp
-            retro_y = -self.vy / sp
+            # Main engine exhaust fires from the stern along the ship's rear axis
+            rear_ang = self.angle + math.pi   # pointing straight back
             for _ in range(2):
-                ang   = math.atan2(retro_y, retro_x) + random.gauss(0, 0.28)
+                ang   = rear_ang + random.gauss(0, 0.22)
                 spd   = random.uniform(sp * 0.40, sp * 0.95)
                 max_a = random.uniform(0.15, 0.32)
                 r0    = self.height * random.uniform(0.10, 0.30)
                 self._thruster_particles.append([
-                    cx + retro_x * self.width * 0.44,
-                    cy + retro_y * self.width * 0.44,
+                    cx - cos_a * self.width * 0.44,   # stern position
+                    cy - sin_a * self.width * 0.44,
                     math.cos(ang) * spd,
                     math.sin(ang) * spd,
                     0.0, max_a, r0, 0,
                 ])
 
         if self._dampening and sp > 5.0:
-            # Bow and side thrusters fire in the direction of motion to brake
-            fwd_ang  = math.atan2(self.vy, self.vx)
-            perp_ang = fwd_ang + math.pi / 2
+            # Bow-side thrusters fire forward along the ship heading to brake
             for sign in (1.0, -1.0):
-                jx    = cx + math.cos(perp_ang) * self.height * 0.50 * sign
-                jy    = cy + math.sin(perp_ang) * self.height * 0.50 * sign
+                # Front corners of the ship based on heading, not velocity
+                jx    = cx + cos_a * self.width * 0.30 + sin_a * self.height * 0.50 * sign
+                jy    = cy + sin_a * self.width * 0.30 - cos_a * self.height * 0.50 * sign
                 spd   = random.uniform(sp * 0.10, sp * 0.35)
-                ang   = fwd_ang + random.gauss(0, 0.20)   # fire forward to brake
+                ang   = self.angle + random.gauss(0, 0.20)   # exhaust fires forward = thrust brakes
                 max_a = random.uniform(0.10, 0.22)
                 r0    = self.height * random.uniform(0.05, 0.15)
                 self._thruster_particles.append([
@@ -736,6 +758,29 @@ class AICharacter(Entity):
                     math.cos(ang) * spd,
                     math.sin(ang) * spd,
                     0.0, max_a, r0, 1,
+                ])
+
+        # Side RCS thrusters cancel lateral drift relative to ship heading
+        lat = self._lat_vel
+        if sp > 5.0 and abs(lat) > 8.0:
+            # The drifting side fires exhaust outward to push back against drift
+            side = 1.0 if lat > 0 else -1.0
+            # Spawn two ports along the ship length (front-third and rear-third)
+            for frac in (0.30, -0.30):
+                port_x = cx + cos_a * self.width * frac + sin_a * self.height * 0.50 * side
+                port_y = cy + sin_a * self.width * frac - cos_a * self.height * 0.50 * side
+                # Exhaust fires outward from the ship side
+                exhaust_ang = math.atan2(-cos_a * side, sin_a * side)
+                lat_sp = abs(lat)
+                ang    = exhaust_ang + random.gauss(0, 0.18)
+                spd    = random.uniform(lat_sp * 0.20, lat_sp * 0.60)
+                max_a  = random.uniform(0.08, 0.16)
+                r0     = self.height * random.uniform(0.04, 0.11)
+                self._thruster_particles.append([
+                    port_x, port_y,
+                    math.cos(ang) * spd,
+                    math.sin(ang) * spd,
+                    0.0, max_a, r0, 2,
                 ])
 
     def _draw_particles(self, surface: pygame.Surface, camera) -> None:
@@ -754,11 +799,17 @@ class AICharacter(Entity):
                     int(150 * t * t),
                     int(20  * t * t * t),
                 )
-            else:            # dampener: cyan → blue → dark
+            elif p[7] == 1: # dampener: cyan → blue → dark
                 col = (
                     int(30  * t),
                     int(140 * t * t),
                     min(255, int(240 * t + 15)),
+                )
+            else:            # RCS side thruster: bright white-violet puff
+                col = (
+                    min(255, int(200 * t + 55 * t * t)),
+                    min(255, int(160 * t * t + 40 * t)),
+                    min(255, int(255 * t)),
                 )
             pygame.draw.circle(surface, col, (int(sx), int(sy)), r)
 
@@ -870,9 +921,11 @@ class Fighter(AICharacter):
     Very fast and agile, but fragile and lightly armed.
     """
 
-    LAUNCH_DURATION = 2.2   # seconds for catapult roll and climb-out
-    DOCK_RADIUS     = 85.0  # world units from carrier centre to trigger docking
-    RETURN_IDLE_T   = 9.0   # seconds without a target before starting return approach
+    LAUNCH_DURATION = 2.2    # seconds for catapult roll and climb-out
+    DOCK_RADIUS     = 185.0  # unused legacy — kept for reference
+    LAND_RANGE      = 160.0  # world units from carrier centre to trigger landing sequence
+    LAND_DURATION   = 0.75   # seconds the landing slide animation plays
+    RETURN_IDLE_T   = 9.0    # seconds without a target before starting return approach
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int, home_carrier=None):
@@ -896,6 +949,7 @@ class Fighter(AICharacter):
         self._launch_t     = self.LAUNCH_DURATION
         self._launch_angle = home_carrier.angle if home_carrier is not None else self.angle
         self._returning    = False   # True while flying back to dock on the carrier
+        self._landing_t    = -1.0   # -1 = not landing; ≥0 = landing slide in progress
         self._idle_t       = 0.0    # seconds elapsed with no combat target
 
         # Fixed forward wing-mounted guns — no rotating turret
@@ -917,14 +971,32 @@ class Fighter(AICharacter):
             self.wx      += self.vx * dt
             self.wy      += self.vy * dt
             self._thrusting = True
-        elif self._returning and self.home_carrier is not None and self.home_carrier.alive:
-            # Dock when centre of fighter reaches DOCK_RADIUS of carrier centre
+            return
+
+        if self._landing_t >= 0:
+            # Landing slide: lock heading to carrier, bleed off speed, then dock
+            self._landing_t += dt
+            if self.home_carrier is not None:
+                self.angle = self.home_carrier.angle
+            decel = max(0.0, 1.0 - 7.0 * dt)
+            self.vx *= decel
+            self.vy *= decel
+            self.wx += self.vx * dt
+            self.wy += self.vy * dt
+            self._emit_particles(dt)
+            if self._landing_t >= self.LAND_DURATION:
+                self.alive = False
+            return
+
+        if self._returning and self.home_carrier is not None and self.home_carrier.alive:
             hcx = self.home_carrier.wx + self.home_carrier.width  / 2
             hcy = self.home_carrier.wy + self.home_carrier.height / 2
             fx  = self.wx + self.width  / 2
             fy  = self.wy + self.height / 2
-            if math.hypot(fx - hcx, fy - hcy) < self.DOCK_RADIUS:
-                self.alive = False   # docked — carrier draw() will show it as parked
+            dist = math.hypot(fx - hcx, fy - hcy)
+            # Trigger landing slide once the fighter is close to the carrier hull
+            if dist < self.LAND_RANGE:
+                self._landing_t = 0.0
                 return
             super().update(dt)
         else:
@@ -933,8 +1005,8 @@ class Fighter(AICharacter):
             super().update(dt)
 
     def update_combat(self, dt: float, all_ships: list, lasers: list) -> None:
-        if self._launch_t > 0:
-            return   # weapons hold during launch roll
+        if self._launch_t > 0 or self._landing_t >= 0:
+            return   # weapons hold during launch roll and landing slide
 
         # ── Returning to carrier ──────────────────────────────────────────────
         if self._returning:
@@ -943,13 +1015,22 @@ class Fighter(AICharacter):
             else:
                 hcx   = self.home_carrier.wx + self.home_carrier.width  / 2
                 hcy   = self.home_carrier.wy + self.home_carrier.height / 2
-                cos_a = math.cos(self.home_carrier.angle)
-                sin_a = math.sin(self.home_carrier.angle)
-                # Aim for the carrier bow so the approach looks like a landing
-                self._movement_override = (
-                    hcx + cos_a * self.home_carrier.width * 0.40,
-                    hcy + sin_a * self.home_carrier.width * 0.40,
-                )
+                cos_c = math.cos(self.home_carrier.angle)
+                sin_c = math.sin(self.home_carrier.angle)
+                fx    = self.wx + self.width  / 2
+                fy    = self.wy + self.height / 2
+                # Dot product: positive means fighter is ahead of carrier, negative = behind
+                ahead = (fx - hcx) * cos_c + (fy - hcy) * sin_c
+                if ahead > -self.home_carrier.width * 0.25:
+                    # Fighter is in front of or beside the carrier — route to a
+                    # waypoint well behind the stern so it loops around properly
+                    self._movement_override = (
+                        hcx - cos_c * (self.home_carrier.width * 0.5 + 280),
+                        hcy - sin_c * (self.home_carrier.width * 0.5 + 280),
+                    )
+                else:
+                    # Fighter is behind the carrier — fly straight in to the deck
+                    self._movement_override = (hcx, hcy)
                 self.combat_state = 'patrol'
             return
 
@@ -1043,7 +1124,7 @@ class Carrier(AICharacter):
     Deploys fighters both proactively and defensively when enemies are detected.
     """
 
-    MAX_FIGHTERS    = 5      # maximum active fighters per carrier
+    MAX_FIGHTERS    = 15     # maximum active fighters per carrier
     DEPLOY_INTERVAL = 10.0   # seconds between fighter deployments
 
     # Six possible AA turret positions around the hull perimeter (lx_frac, ly_frac)
@@ -1055,8 +1136,8 @@ class Carrier(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int):
-        w = random.randint(180, 240)
-        h = random.randint(80, 120)
+        w = random.randint(320, 400)
+        h = random.randint(130, 170)
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override stats: slow, tanky, light AA armament
@@ -1226,25 +1307,33 @@ class Carrier(AICharacter):
         ]
         pygame.draw.polygon(surface, deck_color, deck_pts)
 
-        # Parked fighters on the flight deck
+        # Parked fighters on the flight deck — 3 rows of 5
         in_hangar = max(0, self.MAX_FIGHTERS - sum(1 for f in self._active_fighters if f.alive))
         if in_hangar > 0 and L > 10:
-            fw    = max(3, int(L * 0.090))   # fighter half-length in screen px
-            fh    = max(2, int(fw * 0.48))   # fighter half-width
+            fw    = max(2, int(L * 0.055))   # fighter half-length in screen px
+            fh    = max(1, int(fw * 0.45))   # fighter half-width
             f_col = _FIGHTER_COLORS[self.team]
-            x_min_f = -0.58
-            x_max_f =  0.68
-            step_f  = (x_max_f - x_min_f) / max(1, self.MAX_FIGHTERS - 1)
-            for s in range(in_hangar):
-                slot_lx = (x_min_f + s * step_f) * L
-                slot_ly = 0.01 * W
-                fsx = cx + slot_lx * cos_a - slot_ly * sin_a
-                fsy = cy + slot_lx * sin_a + slot_ly * cos_a
-                # Tiny arrowhead pointing in carrier heading direction
-                nose = (fsx + cos_a * fw,                       fsy + sin_a * fw)
-                wl   = (fsx - cos_a * fw * 0.55 + sin_a * fh,   fsy - sin_a * fw * 0.55 - cos_a * fh)
-                wr   = (fsx - cos_a * fw * 0.55 - sin_a * fh,   fsy - sin_a * fw * 0.55 + cos_a * fh)
-                pygame.draw.polygon(surface, f_col, [nose, wl, wr])
+            COLS  = 5
+            # Three deck rows (in local ly fractions of W)
+            row_ly = (-0.065, 0.005, 0.075)
+            x_min_f, x_max_f = -0.60, 0.65
+            col_step = (x_max_f - x_min_f) / max(1, COLS - 1)
+            drawn = 0
+            for row_idx, ly_frac in enumerate(row_ly):
+                for col_idx in range(COLS):
+                    if drawn >= in_hangar:
+                        break
+                    slot_lx = (x_min_f + col_idx * col_step) * L
+                    slot_ly = ly_frac * W
+                    fsx = cx + slot_lx * cos_a - slot_ly * sin_a
+                    fsy = cy + slot_lx * sin_a + slot_ly * cos_a
+                    nose = (fsx + cos_a * fw,                      fsy + sin_a * fw)
+                    wl   = (fsx - cos_a * fw * 0.55 + sin_a * fh,  fsy - sin_a * fw * 0.55 - cos_a * fh)
+                    wr   = (fsx - cos_a * fw * 0.55 - sin_a * fh,  fsy - sin_a * fw * 0.55 + cos_a * fh)
+                    pygame.draw.polygon(surface, f_col, [nose, wl, wr])
+                    drawn += 1
+                if drawn >= in_hangar:
+                    break
 
         # Island superstructure (starboard side)
         isl_color = (
