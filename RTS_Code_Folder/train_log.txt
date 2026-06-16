@@ -1,0 +1,56 @@
+pygame-ce 2.5.7 (SDL 2.32.10, Python 3.14.5)
+[train] 12 worker processes, 12 episodes/round, max_seconds=150.0 dt=0.05
+[train] round     1 | episodes     12 | loss +0.0830 (pi +0.0572 v 0.0830 ent 7.846) | mean_return +0.006 | team0_winrate(last50) 0.42 | wall 1.8m
+[train] round     2 | episodes     24 | loss -0.0489 (pi -0.1249 v 0.1816 ent 7.381) | mean_return +0.013 | team0_winrate(last50) 0.50 | wall 3.8m
+[train] checkpoint saved (round 2)
+[train] round     3 | episodes     36 | loss -0.0523 (pi -0.1248 v 0.1749 ent 7.428) | mean_return +0.009 | team0_winrate(last50) 0.50 | wall 5.8m
+[train] round     4 | episodes     48 | loss -0.0792 (pi -0.1385 v 0.1485 ent 7.460) | mean_return +0.004 | team0_winrate(last50) 0.48 | wall 7.7m
+[train] checkpoint saved (round 4)
+[train] round     5 | episodes     60 | loss -0.0640 (pi -0.1024 v 0.1088 ent 8.036) | mean_return +0.007 | team0_winrate(last50) 0.44 | wall 9.6m
+[train] round     6 | episodes     72 | loss -0.1038 (pi -0.1432 v 0.1099 ent 7.791) | mean_return +0.004 | team0_winrate(last50) 0.40 | wall 11.4m
+[train] checkpoint saved (round 6)
+[train] round     7 | episodes     84 | loss -0.1052 (pi -0.1189 v 0.0594 ent 8.018) | mean_return +0.008 | team0_winrate(last50) 0.34 | wall 13.3m
+[train] round     8 | episodes     96 | loss -0.1271 (pi -0.2035 v 0.1827 ent 7.472) | mean_return +0.021 | team0_winrate(last50) 0.32 | wall 15.1m
+[train] checkpoint saved (round 8)
+[train] round     9 | episodes    108 | loss -0.1144 (pi -0.1499 v 0.1011 ent 7.540) | mean_return +0.009 | team0_winrate(last50) 0.36 | wall 16.9m
+[train] round    10 | episodes    120 | loss -0.0937 (pi -0.1309 v 0.1039 ent 7.340) | mean_return +0.001 | team0_winrate(last50) 0.40 | wall 18.8m
+[train] checkpoint saved (round 10)
+[train] === eval vs rule-based AICommander: 50% win rate over 6 matches ===
+[train] round    11 | episodes    132 | loss -0.1318 (pi -0.1819 v 0.1310 ent 7.661) | mean_return +0.013 | team0_winrate(last50) 0.46 | wall 21.8m
+[train] round    12 | episodes    144 | loss -0.0540 (pi -0.0894 v 0.1022 ent 7.835) | mean_return +0.014 | team0_winrate(last50) 0.52 | wall 23.6m
+[train] checkpoint saved (round 12)
+[train] round    13 | episodes    156 | loss -0.0633 (pi -0.0800 v 0.0633 ent 7.479) | mean_return +0.000 | team0_winrate(last50) 0.54 | wall 25.6m
+[train] round    14 | episodes    168 | loss -0.0362 (pi -0.0673 v 0.0928 ent 7.665) | mean_return +0.009 | team0_winrate(last50) 0.52 | wall 27.4m
+[train] checkpoint saved (round 14)
+[train] round    15 | episodes    180 | loss -0.0313 (pi -0.0520 v 0.0723 ent 7.771) | mean_return +0.000 | team0_winrate(last50) 0.48 | wall 29.4m
+[train] round    16 | episodes    192 | loss -0.0191 (pi -0.0259 v 0.0445 ent 7.721) | mean_return +0.000 | team0_winrate(last50) 0.42 | wall 31.3m
+[train] checkpoint saved (round 16)
+[train] round    17 | episodes    204 | loss -0.0139 (pi -0.0343 v 0.0731 ent 8.073) | mean_return +0.011 | team0_winrate(last50) 0.40 | wall 33.3m
+[train] round    18 | episodes    216 | loss -0.0069 (pi -0.0322 v 0.0823 ent 7.910) | mean_return +0.008 | team0_winrate(last50) 0.38 | wall 35.2m
+[train] checkpoint saved (round 18)
+[train] round    19 | episodes    228 | loss -0.0231 (pi -0.0538 v 0.0932 ent 7.899) | mean_return +0.009 | team0_winrate(last50) 0.38 | wall 37.1m
+[train] round    20 | episodes    240 | loss -0.0305 (pi -0.0533 v 0.0759 ent 7.583) | mean_return +0.010 | team0_winrate(last50) 0.40 | wall 38.9m
+[train] checkpoint saved (round 20)
+[train] === eval vs rule-based AICommander: 50% win rate over 6 matches ===
+[train] round    21 | episodes    252 | loss -0.0027 (pi -0.0165 v 0.0608 ent 8.283) | mean_return +0.003 | team0_winrate(last50) 0.44 | wall 42.0m
+[train] round    22 | episodes    264 | loss -0.0569 (pi -0.0792 v 0.0748 ent 7.559) | mean_return +0.010 | team0_winrate(last50) 0.36 | wall 43.9m
+[train] checkpoint saved (round 22)
+[train] round    23 | episodes    276 | loss -0.0404 (pi -0.0528 v 0.0562 ent 7.856) | mean_return +0.010 | team0_winrate(last50) 0.30 | wall 45.9m
+[train] round    24 | episodes    288 | loss -0.1061 (pi -0.1550 v 0.1260 ent 7.049) | mean_return +0.044 | team0_winrate(last50) 0.38 | wall 47.7m
+[train] checkpoint saved (round 24)
+[train] round    25 | episodes    300 | loss -0.0667 (pi -0.1052 v 0.1064 ent 7.375) | mean_return +0.040 | team0_winrate(last50) 0.36 | wall 49.6m
+[train] round    26 | episodes    312 | loss -0.0507 (pi -0.0921 v 0.1133 ent 7.619) | mean_return +0.000 | team0_winrate(last50) 0.46 | wall 51.6m
+[train] checkpoint saved (round 26)
+[train] round    27 | episodes    324 | loss -0.0793 (pi -0.0924 v 0.0596 ent 8.353) | mean_return +0.002 | team0_winrate(last50) 0.50 | wall 53.5m
+[train] round    28 | episodes    336 | loss -0.0554 (pi -0.0699 v 0.0609 ent 7.987) | mean_return +0.000 | team0_winrate(last50) 0.46 | wall 55.4m
+[train] checkpoint saved (round 28)
+[train] round    29 | episodes    348 | loss -0.0600 (pi -0.0772 v 0.0650 ent 7.691) | mean_return +0.007 | team0_winrate(last50) 0.42 | wall 57.4m
+[train] round    30 | episodes    360 | loss -0.0539 (pi -0.0837 v 0.0895 ent 7.448) | mean_return +0.010 | team0_winrate(last50) 0.40 | wall 59.3m
+[train] checkpoint saved (round 30)
+[train] === eval vs rule-based AICommander: 50% win rate over 6 matches ===
+[train] round    31 | episodes    372 | loss -0.0384 (pi -0.0610 v 0.0751 ent 7.466) | mean_return +0.004 | team0_winrate(last50) 0.40 | wall 62.5m
+[train] round    32 | episodes    384 | loss -0.0110 (pi -0.0296 v 0.0664 ent 7.262) | mean_return +0.006 | team0_winrate(last50) 0.46 | wall 64.4m
+[train] checkpoint saved (round 32)
+[train] round    33 | episodes    396 | loss +0.0004 (pi +0.0005 v 0.0313 ent 7.849) | mean_return +0.000 | team0_winrate(last50) 0.44 | wall 66.4m
+[train] round    34 | episodes    408 | loss +0.0034 (pi -0.0157 v 0.0692 ent 7.752) | mean_return +0.013 | team0_winrate(last50) 0.42 | wall 68.5m
+[train] checkpoint saved (round 34)
