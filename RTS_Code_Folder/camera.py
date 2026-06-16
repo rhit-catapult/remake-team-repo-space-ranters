@@ -42,9 +42,19 @@ class Camera:
 
     def is_visible(self, world_rect: pygame.Rect) -> bool:
         """Return True if any part of world_rect is within the viewport."""
-        screen_rect = self.world_rect_to_screen(world_rect)
-        viewport    = pygame.Rect(0, 0, self.screen_width, self.screen_height)
-        return viewport.colliderect(screen_rect)
+        sx = (world_rect.x - self.x) * self.zoom
+        sy = (world_rect.y - self.y) * self.zoom
+        sw = world_rect.width  * self.zoom
+        sh = world_rect.height * self.zoom
+        return (sx + sw > 0 and sx < self.screen_width and
+                sy + sh > 0 and sy < self.screen_height)
+
+    def is_visible_xywh(self, wx: float, wy: float, w: float, h: float) -> bool:
+        """Visibility check without a Rect allocation — use from hot draw paths."""
+        sx = (wx - self.x) * self.zoom
+        sy = (wy - self.y) * self.zoom
+        return (sx + w * self.zoom > 0 and sx < self.screen_width and
+                sy + h * self.zoom > 0 and sy < self.screen_height)
 
     # ── Viewport dimensions in world space ───────────────────────────────────
 

@@ -63,19 +63,17 @@ class Star(Entity):
         self.cx = cx
         self.cy = cy
         self.radius = radius
+        self._glow_color = tuple(min(255, c + 80) for c in color)
 
     def update(self, dt: float):
         pass
 
     def draw(self, surface: pygame.Surface, camera) -> None:
-        if not camera.is_visible(self.world_rect):
+        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
             return
         sx, sy = camera.world_to_screen(self.cx, self.cy)
         r = max(1, int(self.radius * camera.zoom))
-        glow = max(0, min(80, int(14 * camera.zoom)))
-        pygame.draw.circle(surface,
-                           tuple(min(255, c + glow) for c in self.color),
-                           (sx, sy), r + 4)
+        pygame.draw.circle(surface, self._glow_color, (sx, sy), r + 4)
         pygame.draw.circle(surface, self.color, (sx, sy), r)
 
 
@@ -117,7 +115,7 @@ class Planet(Entity):
             if orbit_r > 2:
                 pygame.draw.circle(surface, (80, 80, 90), (sx, sy), orbit_r, 1)
 
-        if not camera.is_visible(self.world_rect):
+        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
             return
 
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
@@ -133,6 +131,9 @@ class Constructor(Entity):
     _BUILD_ORDER = ['Carrier', 'Destroyer', 'AICharacter', 'AICharacter']
     _COLORS = [(180, 220, 255), (255, 180, 180)]
 
+    # Chimney x-offsets as fractions of factory half-width (radius * 4)
+    _CHIMNEY_FRACS = (-0.72, -0.36, 0.0, 0.36, 0.72)
+
     def __init__(self, home_planet: Planet, orbit_radius: float,
                  angle: float, team: int, orbit_speed: float = 0.9):
         self.home_planet = home_planet
@@ -146,38 +147,45 @@ class Constructor(Entity):
         self.time = 0.0
         self.smoke_timer = 0.0
         self.smoke = []  # list of [dx, dy, vy, life, max_life, size]
-        radius = 18
+        radius = 65
         color = self._COLORS[team]
         super().__init__(home_planet.star_x + math.cos(angle) * orbit_radius - radius,
                          home_planet.star_y + math.sin(angle) * orbit_radius - radius,
                          radius * 2, radius * 2, color)
         self.radius = radius
+        self.face_angle = angle - math.pi * 0.5
+        self._col_dark   = tuple(max(0, c - 90) for c in color)
+        self._col_mid    = tuple(max(0, c - 45) for c in color)
+        self._col_bright = tuple(min(255, c + 60) for c in color)
 
     def update(self, dt: float):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
         self.wx = self.home_planet.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
         self.wy = self.home_planet.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
         self.time += dt
+        # Local -Y axis (chimney side) points toward the star.
+        self.face_angle = self.angle - math.pi * 0.5
 
-        # Smokestack puffs — constant low-rate plume, faster while actively building
         self.smoke_timer -= dt
         progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
-        spawn_rate = 0.5 - 0.3 * progress
+        spawn_rate = 0.35 - 0.25 * progress
         if self.smoke_timer <= 0.0:
             self.smoke_timer = spawn_rate
-            for chimney_dx in (-self.radius * 0.5, self.radius * 0.5):
-                self.smoke.append([
-                    chimney_dx + random.uniform(-2, 2),
-                    -self.radius * 0.9,
-                    -random.uniform(8, 14),
-                    0.0,
-                    random.uniform(1.0, 1.6),
-                    random.uniform(3, 5),
-                ])
+            frac = random.choice(self._CHIMNEY_FRACS)
+            chimney_dx = frac * self.radius * 4 + random.uniform(-4, 4)
+            chimney_top = -(self.radius + self.radius * 0.85)
+            self.smoke.append([
+                chimney_dx,
+                chimney_top,
+                -random.uniform(18, 32),
+                0.0,
+                random.uniform(1.4, 2.2),
+                random.uniform(5, 10),
+            ])
         for puff in self.smoke:
             puff[3] += dt
             puff[1] += puff[2] * dt
-            puff[0] += math.sin(self.time * 2.0 + puff[1]) * 6 * dt
+            puff[0] += math.sin(self.time * 1.8 + puff[1] * 0.05) * 8 * dt
         self.smoke = [p for p in self.smoke if p[3] < p[4]]
 
         self.build_timer -= dt
@@ -207,72 +215,318 @@ class Constructor(Entity):
         ]
 
     def draw(self, surface: pygame.Surface, camera) -> None:
-        if not camera.is_visible(self.world_rect):
+        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
             return
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         r = max(2, int(self.radius * camera.zoom))
         zoom = camera.zoom
         progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
-        dark = tuple(max(0, c - 90) for c in self.color)
 
-        # Soft pulsing glow while building, drawn on an alpha layer
-        if progress > 0.0:
-            glow_r = int(r * (1.6 + 0.25 * math.sin(self.time * 4.0)))
-            glow = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
-            alpha = int(70 * progress)
-            pygame.draw.circle(glow, (255, 220, 100, alpha), (glow_r, glow_r), glow_r)
-            surface.blit(glow, (cx - glow_r, cy - glow_r))
+        col    = self.color
+        dark   = self._col_dark
+        mid    = self._col_mid
+        bright = self._col_bright
 
-        # Smokestack plumes (drawn behind the hull)
+        # Factory physical dimensions in screen pixels
+        W = r * 4   # half-width  (along factory length)
+        H = r       # half-height (perpendicular; chimneys at -H, girder at +H)
+
+        # Rotation helpers — local (dx, dy) → screen (px, py).
+        # face_angle keeps the chimney side (-Y) always aimed at the star.
+        cos_f = math.cos(self.face_angle)
+        sin_f = math.sin(self.face_angle)
+
+        def rot(dx, dy):
+            return (int(cx + dx * cos_f - dy * sin_f),
+                    int(cy + dx * sin_f + dy * cos_f))
+
+        lw = max(1, int(zoom))
+
+        # ── Smoke plumes — rotated into world orientation ─────────────────────
         for dx, dy, _vy, life, max_life, size in self.smoke:
             fade = max(0.0, 1.0 - life / max_life)
             if fade <= 0.0:
                 continue
-            px, py = cx + dx * zoom, cy + dy * zoom
-            psize = max(1, int(size * zoom * (1.0 + life)))
-            shade = int(120 + 60 * fade)
-            puff = pygame.Surface((psize * 2, psize * 2), pygame.SRCALPHA)
-            pygame.draw.circle(puff, (shade, shade, shade, int(160 * fade)), (psize, psize), psize)
-            surface.blit(puff, (px - psize, py - psize))
+            px, py = rot(dx * zoom, dy * zoom)
+            psize = max(1, int(size * zoom * (1.0 + life * 0.6)))
+            shade = int((110 + 70 * fade) * fade)
+            pygame.draw.circle(surface, (shade, shade, shade), (px, py), psize)
 
-        # Octagonal factory hull with industrial girder cross-bracing
-        hull_rot = self.time * 0.15
-        hull_pts = self._poly_points(cx, cy, r, 8, hull_rot)
-        pygame.draw.polygon(surface, self.color, hull_pts)
-        pygame.draw.polygon(surface, (255, 255, 255), hull_pts, 1)
-        for i in range(0, 8, 2):
-            pygame.draw.line(surface, dark, hull_pts[i], hull_pts[(i + 4) % 8], max(1, int(zoom)))
+        # ── Main hull (rotated polygon) ───────────────────────────────────────
+        hull_pts = [rot(-W, -H), rot(W, -H), rot(W, H), rot(-W, H)]
+        pygame.draw.polygon(surface, dark, hull_pts)
+        pygame.draw.polygon(surface, col, hull_pts, max(1, int(2 * zoom)))
 
-        # Twin smokestacks
-        for chimney_dx in (-r * 0.5, r * 0.5):
-            top = (cx + chimney_dx, cy - r * 0.9)
-            base = (cx + chimney_dx, cy - r * 0.4)
-            pygame.draw.line(surface, dark, base, top, max(2, int(3 * zoom)))
+        # ── Bay dividers ──────────────────────────────────────────────────────
+        n_bays = 5
+        for i in range(1, n_bays):
+            dx_div = -W + i * (2 * W // n_bays)
+            pygame.draw.line(surface, mid, rot(dx_div, -H), rot(dx_div, H), lw)
 
-        # Blinking corner lights — staggered phase per vertex
-        for i, (px, py) in enumerate(hull_pts):
-            brightness = 0.5 + 0.5 * math.sin(self.time * 3.0 + i * 0.8)
-            light_color = (255, int(180 + 60 * brightness), int(60 * brightness))
-            pygame.draw.circle(surface, light_color, (int(px), int(py)), max(1, int(2 * zoom)))
+        # ── Central assembly bay ──────────────────────────────────────────────
+        bw = int(W * 0.48)
+        bh = int(H * 0.65)
+        bay_pts = [rot(-bw, -bh), rot(bw, -bh), rot(bw, bh), rot(-bw, bh)]
+        pygame.draw.polygon(surface, mid, bay_pts)
+        pygame.draw.polygon(surface, bright, bay_pts, lw)
 
-        # Rotating central gearwork — two interlocking gears spinning opposite ways
-        gear_r = max(2, int(r * 0.45))
-        for spin_dir, offset in ((1, 0.0), (-1, math.pi)):
-            gear_pts = self._poly_points(cx, cy, gear_r, 6, spin_dir * self.time * 1.5 + offset)
-            pygame.draw.polygon(surface, dark, gear_pts, max(1, int(2 * zoom)))
+        # Rotating assembly arm in local factory space
+        arm_r = max(2, min(bw, bh) - max(1, int(3 * zoom)))
+        arm_a = self.time * 1.4 * (1.0 + progress * 0.6)
+        cos_a = math.cos(arm_a) * arm_r
+        sin_a = math.sin(arm_a) * arm_r
+        pygame.draw.line(surface, bright, (cx, cy), rot(int(cos_a),  int(sin_a)),  max(1, int(2 * zoom)))
+        pygame.draw.line(surface, bright, (cx, cy), rot(int(-cos_a), int(-sin_a)), max(1, int(2 * zoom)))
 
-        # Build progress ring
+        # ── Back girder rail (away from sun) ──────────────────────────────────
+        rail_off = H + max(1, int(3 * zoom))
+        pygame.draw.line(surface, bright, rot(-W, rail_off), rot(W, rail_off),
+                         max(1, int(2 * zoom)))
+        brace_drop = max(2, int(7 * zoom))
+        for i in range(4):
+            dx1 = -W + i * (2 * W // 4)
+            dx2 = -W + (i + 1) * (2 * W // 4)
+            dxm = (dx1 + dx2) // 2
+            pygame.draw.line(surface, mid, rot(dx1, rail_off), rot(dxm, rail_off + brace_drop), lw)
+            pygame.draw.line(surface, mid, rot(dx2, rail_off), rot(dxm, rail_off + brace_drop), lw)
+
+        # ── Five chimney stacks (point toward the star) ───────────────────────
+        stack_h = int(H * 0.85)
+        stack_w = max(2, int(r * 0.22))
+        stack_tops = []
+        for i, frac in enumerate(self._CHIMNEY_FRACS):
+            dx_s = int(frac * W)
+            base = rot(dx_s, -H)
+            top  = rot(dx_s, -H - stack_h)
+            stack_tops.append(top)
+            pygame.draw.line(surface, dark,  base, top, stack_w + 1)
+            pygame.draw.line(surface, mid,   base, top, max(1, stack_w - 1))
+            pygame.draw.line(surface, bright,
+                             rot(dx_s - stack_w, -H - stack_h),
+                             rot(dx_s + stack_w, -H - stack_h),
+                             lw)
+
+        # ── Side radiator fins ─────────────────────────────────────────────────
+        fin_len = int(H * 0.75)
+        for side in (-1, 1):
+            for fi in range(3):
+                fy = -H // 2 + fi * H // 2
+                pygame.draw.line(surface, mid,
+                                 rot(side * W, fy),
+                                 rot(side * (W + fin_len), fy), lw)
+
+        # ── Corner warning lights ──────────────────────────────────────────────
+        for i, (dx_c, dy_c) in enumerate([(-W, -H), (W, -H), (-W, H), (W, H)]):
+            b = 0.5 + 0.5 * math.sin(self.time * 3.0 + i * 1.5)
+            pygame.draw.circle(surface, (255, int(80 + 100 * b), 0),
+                               rot(dx_c, dy_c), max(1, int(2 * zoom)))
+
+        # Stack-top hazard lights
+        for i, pt in enumerate(stack_tops):
+            b = 0.5 + 0.5 * math.sin(self.time * 4.5 + i * 0.9)
+            if b > 0.55:
+                pygame.draw.circle(surface, (255, 60, 0), pt, max(1, int(2 * zoom)))
+
+        # ── Build progress bar (behind the factory, rotated) ──────────────────
         if progress > 0.0:
-            end_angle = progress * math.tau
-            steps = 18
-            points = []
-            for i in range(steps + 1):
-                a = end_angle * i / steps
-                px = cx + math.cos(a) * (r + 6)
-                py = cy + math.sin(a) * (r + 6)
-                points.append((px, py))
-            if len(points) >= 2:
-                pygame.draw.lines(surface, (255, 255, 100), False, points, 2)
+            bar_off = rail_off + max(2, int(4 * zoom))
+            bar_h_px = max(1, int(3 * zoom))
+            bar_end = -W + int(2 * W * progress)
+            bar_pts = [rot(-W, bar_off), rot(bar_end, bar_off),
+                       rot(bar_end, bar_off + bar_h_px), rot(-W, bar_off + bar_h_px)]
+            pygame.draw.polygon(surface, (255, 220, 60), bar_pts)
+
+
+
+class DysonSphere(Entity):
+    """Megastructure energy-collector ring encircling the team star."""
+
+    _RING_COLORS = [(60, 140, 255), (255, 60, 60)]
+
+    def __init__(self, star_x: float, star_y: float, star_radius: int, team: int):
+        self.star_x = star_x
+        self.star_y = star_y
+        self.star_radius = star_radius
+        self.team = team
+        self.orbit_radius = star_radius + 350
+        self.rotation = 0.0
+        self.time = 0.0
+        color = self._RING_COLORS[team]
+        r = self.orbit_radius
+        super().__init__(star_x - r, star_y - r, r * 2, r * 2, color)
+        self._col_bright = tuple(min(255, c + 80) for c in color)
+        self._col_dim    = tuple(max(0, c - 60)  for c in color)
+        # Precomputed spoke step (radians)
+        self._spoke_step = math.tau / 16
+        self._panel_step = math.tau / 8
+        self._node_step  = math.tau / 6
+
+    def update(self, dt: float):
+        self.rotation = (self.rotation + 0.012 * dt) % math.tau
+        self.time += dt
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
+            return
+        sx, sy = camera.world_to_screen(self.star_x, self.star_y)
+        r = int(self.orbit_radius * camera.zoom)
+        if r < 4:
+            return
+        zoom = camera.zoom
+        col    = self.color
+        bright = self._col_bright
+        dim    = self._col_dim
+
+        # Energy corona glow — concentric rings, no Surface allocation
+        pulse  = 0.6 + 0.4 * math.sin(self.time * 1.2)
+        glow_r = r + max(2, int(10 * zoom))
+        thick  = max(1, int(6 * zoom))
+        for step in range(3, 0, -1):
+            frac = step / 3
+            gc = (int(col[0] * frac * 0.45 * pulse),
+                  int(col[1] * frac * 0.45 * pulse),
+                  int(col[2] * frac * 0.45 * pulse))
+            pygame.draw.circle(surface, gc, (sx, sy),
+                               glow_r + thick * (3 - step), thick)
+
+        # Outer structural ring
+        pygame.draw.circle(surface, col, (sx, sy), r, max(1, int(3 * zoom)))
+
+        # Inner support ring
+        inner_r = int(r * 0.72)
+        pygame.draw.circle(surface, dim, (sx, sy), inner_r, max(1, int(zoom)))
+
+        # Radial spokes
+        step = self._spoke_step
+        lw   = max(1, int(zoom))
+        for i in range(16):
+            angle = self.rotation + i * step
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            pygame.draw.line(surface, dim,
+                             (int(sx + cos_a * r),      int(sy + sin_a * r)),
+                             (int(sx + cos_a * inner_r), int(sy + sin_a * inner_r)),
+                             lw)
+
+        # Panel chord bracing
+        step8 = self._panel_step
+        for i in range(8):
+            a1 = self.rotation + i * step8
+            a2 = a1 + step8
+            pygame.draw.line(surface, dim,
+                             (int(sx + math.cos(a1) * r), int(sy + math.sin(a1) * r)),
+                             (int(sx + math.cos(a2) * r), int(sy + math.sin(a2) * r)),
+                             lw)
+
+        # Energy-collector nodes — no Surface allocation
+        node_rot  = self.rotation * 0.6
+        step6     = self._node_step
+        node_r    = max(2, int(5 * zoom))
+        node_r2   = node_r * 2
+        for i in range(6):
+            angle      = node_rot + i * step6
+            nx         = int(sx + math.cos(angle) * r)
+            ny         = int(sy + math.sin(angle) * r)
+            node_pulse = 0.5 + 0.5 * math.sin(self.time * 2.5 + i * 1.0)
+            gc = (int(bright[0] * node_pulse * 0.6),
+                  int(bright[1] * node_pulse * 0.6),
+                  int(bright[2] * node_pulse * 0.6))
+            pygame.draw.circle(surface, gc, (nx, ny), node_r2)
+            pygame.draw.circle(surface, bright, (nx, ny), node_r)
+
+
+class DysonNode(Entity):
+    """Command/relay station orbiting the Dyson sphere."""
+
+    _COLORS = [(80, 160, 255), (255, 80, 80)]
+
+    def __init__(self, star_x: float, star_y: float, orbit_radius: float,
+                 angle: float, orbit_speed: float, team: int, node_index: int):
+        self.star_x = star_x
+        self.star_y = star_y
+        self.orbit_radius = orbit_radius
+        self.angle = angle
+        self.orbit_speed = orbit_speed
+        self.team = team
+        self.node_index = node_index
+        self.time = 0.0
+        self.radius = 28
+        color = self._COLORS[team]
+        super().__init__(star_x + math.cos(angle) * orbit_radius - self.radius,
+                         star_y + math.sin(angle) * orbit_radius - self.radius,
+                         self.radius * 2, self.radius * 2, color)
+        self._col_bright   = tuple(min(255, c + 80) for c in color)
+        self._col_dark     = tuple(max(0, c - 80)   for c in color)
+        self._col_emit     = tuple(min(255, int(c * 0.4 + 150)) for c in color)
+
+    def update(self, dt: float):
+        self.angle = (self.angle + self.orbit_speed * dt) % math.tau
+        self.wx = self.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
+        self.wy = self.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
+        self.time += dt
+
+    @staticmethod
+    def _poly_points(cx, cy, r, sides, rotation=0.0):
+        return [
+            (cx + math.cos(rotation + i * math.tau / sides) * r,
+             cy + math.sin(rotation + i * math.tau / sides) * r)
+            for i in range(sides)
+        ]
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
+            return
+        cx, cy = camera.world_to_screen(
+            self.wx + self.radius, self.wy + self.radius)
+        r = max(2, int(self.radius * camera.zoom))
+        zoom = camera.zoom
+        col    = self.color
+        bright = self._col_bright
+        dark   = self._col_dark
+
+        # Pulsing glow halo — concentric circles, no Surface allocation
+        pulse  = 0.5 + 0.5 * math.sin(self.time * 2.0 + self.node_index * 0.9)
+        glow_r = int(r * 1.8)
+        for step in range(3, 0, -1):
+            frac = step / 3
+            gc = (int(col[0] * frac * pulse * 0.5),
+                  int(col[1] * frac * pulse * 0.5),
+                  int(col[2] * frac * pulse * 0.5))
+            pygame.draw.circle(surface, gc, (cx, cy), int(glow_r * frac))
+
+        # Hexagonal hull, slowly counter-rotating
+        hull_pts = self._poly_points(cx, cy, r, 6, self.time * 0.2)
+        pygame.draw.polygon(surface, col, hull_pts)
+        pygame.draw.polygon(surface, bright, hull_pts, max(1, int(zoom)))
+        lw = max(1, int(zoom))
+        for i in range(0, 6, 2):
+            pygame.draw.line(surface, dark,
+                             (int(hull_pts[i][0]), int(hull_pts[i][1])),
+                             (int(hull_pts[(i + 3) % 6][0]), int(hull_pts[(i + 3) % 6][1])),
+                             lw)
+
+        # Solar panel wings
+        wing_angle = self.time * 0.15 + self.node_index * (math.pi / 3)
+        wing_len = int(r * 1.5)
+        wing_w = max(2, int(r * 0.35))
+        half_pi = math.pi / 2
+        for side in (-1, 1):
+            wa = wing_angle + side * half_pi
+            tip_x = int(cx + math.cos(wa) * wing_len)
+            tip_y = int(cy + math.sin(wa) * wing_len)
+            pygame.draw.line(surface, dark, (cx, cy), (tip_x, tip_y), wing_w + 1)
+            pygame.draw.line(surface, col,  (cx, cy), (tip_x, tip_y), max(1, wing_w - 1))
+
+        # Central energy emitter
+        pygame.draw.circle(surface, self._col_emit, (cx, cy), max(1, int(r * 0.35)))
+
+        # Blinking antenna
+        ant_a = wing_angle - half_pi
+        ant_x = int(cx + math.cos(ant_a) * r * 1.15)
+        ant_y = int(cy + math.sin(ant_a) * r * 1.15)
+        if pulse > 0.65:
+            pygame.draw.circle(surface, (255, 255, 100), (ant_x, ant_y),
+                               max(1, int(2 * zoom)))
 
 
 # Team colour palettes: index 0 = team 0 (blue), index 1 = team 1 (red)

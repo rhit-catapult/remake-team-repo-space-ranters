@@ -35,7 +35,7 @@ import threading
 import pygame
 from camera import Camera
 from entities import (AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer,
-                      Star, Planet, Constructor)
+                      Star, Planet, Constructor, DysonSphere, DysonNode)
 from commander import AICommander
 from neural_commander import NeuralCommander
 
@@ -65,6 +65,39 @@ TEAM_COLORS = [
     (255,  50,  50),   # 1 = Red
 ]
 TEAM_NAMES = ["BLUE COMMAND", "RED COMMAND"]
+
+# ── Cached fonts (initialised on first use after pygame.font.init) ────────────
+_FONT_SM     = None
+_FONT_MED    = None
+_FONT_BANNER = None
+
+def _fonts():
+    global _FONT_SM, _FONT_MED, _FONT_BANNER
+    if _FONT_SM is None:
+        _FONT_SM     = pygame.font.SysFont("monospace", 14)
+        _FONT_MED    = pygame.font.SysFont("monospace", 16)
+        _FONT_BANNER = pygame.font.SysFont("impact", 22)
+    return _FONT_SM, _FONT_MED, _FONT_BANNER
+
+# ── Pre-allocated HUD surfaces (created once, reused every frame) ─────────────
+_HUD_PANEL  = None   # status panel top-left
+_HUD_MM     = None   # minimap
+_HUD_HINTS  = None   # pre-rendered hint text surfaces (never change)
+
+def _ensure_hud_surfaces():
+    global _HUD_PANEL, _HUD_MM, _HUD_HINTS
+    if _HUD_PANEL is not None:
+        return
+    font_sm, _, _ = _fonts()
+    _HUD_PANEL = pygame.Surface((290, 14 + 9 * 18), pygame.SRCALPHA)
+    _HUD_MM    = pygame.Surface((180, 120), pygame.SRCALPHA)
+    hints = [
+        "LMB: Select   Shift+LMB: Add/Remove",
+        "Drag LMB: Box select   Ctrl+A: All",
+        "RMB: Move/Follow/Attack   A+RMB: Attack-move",
+        "Shift+RMB: Queue   Ctrl+1-9: Group   H: Hold   F: Hold fire   Tab: Toggle HUD",
+    ]
+    _HUD_HINTS = [font_sm.render(h, True, (80, 80, 100)) for h in hints]
 
 
 # ── World background ──────────────────────────────────────────────────────────
@@ -456,16 +489,16 @@ def _team_star_position(team):
 
 def _build_solar_system(team):
     star_x, star_y = _team_star_position(team)
-    star = Star(star_x, star_y, radius=525, color=TEAM_COLORS[team])
+    star = Star(star_x, star_y, radius=578, color=TEAM_COLORS[team])
     planet_types = ['home', 'rocky', 'water', 'gas', 'rocky', 'water', 'gas']
     orbit_radii = [1350, 1950, 2550, 3150, 3750, 4350, 4950]
     planets = []
     for i, planet_type in enumerate(planet_types):
         angle = random.uniform(0, math.tau)
         speed = 0.020 - i * 0.0025  # innermost fastest, outermost slowest
-        radius = 195 if planet_type == 'rocky' else 225 if planet_type == 'water' else 300
+        radius = 215 if planet_type == 'rocky' else 248 if planet_type == 'water' else 330
         if planet_type == 'home':
-            radius = 270
+            radius = 297
         planets.append(
             Planet(star_x, star_y, orbit_radii[i], angle, speed,
                    planet_type, team, radius)
@@ -474,7 +507,17 @@ def _build_solar_system(team):
     constructor = Constructor(home_planet, orbit_radius=home_planet.orbit_radius,
                               angle=home_planet.angle + math.pi,
                               team=team, orbit_speed=home_planet.orbit_speed)
-    return [star] + planets + [constructor]
+
+    dyson_sphere = DysonSphere(star_x, star_y, star_radius=578, team=team)
+    dyson_orbit = dyson_sphere.orbit_radius
+    dyson_nodes = [
+        DysonNode(star_x, star_y, orbit_radius=dyson_orbit,
+                  angle=i * math.tau / 4, orbit_speed=0.032,
+                  team=team, node_index=i)
+        for i in range(4)
+    ]
+
+    return [star, dyson_sphere] + dyson_nodes + planets + [constructor]
 
 
 def setup_game():
@@ -627,7 +670,10 @@ def draw_command_marker(surface, camera, wx, wy, elapsed, color):
     pygame.draw.circle(surface, color, (sx, sy), 4)
 
 
+_SELECT_BOX_FILL = None  # reusable tinted fill surface, grown as needed
+
 def draw_select_box(surface, start, end):
+    global _SELECT_BOX_FILL
     if start is None:
         return
     x0, y0 = start
@@ -636,52 +682,65 @@ def draw_select_box(surface, start, end):
     bw, bh = abs(x1 - x0), abs(y1 - y0)
     if bw < 2 or bh < 2:
         return
-    box = pygame.Surface((bw, bh), pygame.SRCALPHA)
-    box.fill((80, 160, 255, 25))
-    pygame.draw.rect(box, (80, 160, 255, 180), (0, 0, bw, bh), 1)
-    surface.blit(box, (bx, by))
+    # Grow the cached fill surface only when the box is larger than ever before
+    if _SELECT_BOX_FILL is None or _SELECT_BOX_FILL.get_width() < bw or _SELECT_BOX_FILL.get_height() < bh:
+        nw = max(bw, _SELECT_BOX_FILL.get_width()  if _SELECT_BOX_FILL else 0)
+        nh = max(bh, _SELECT_BOX_FILL.get_height() if _SELECT_BOX_FILL else 0)
+        _SELECT_BOX_FILL = pygame.Surface((nw, nh), pygame.SRCALPHA)
+        _SELECT_BOX_FILL.fill((80, 160, 255, 25))
+    surface.blit(_SELECT_BOX_FILL, (bx, by), (0, 0, bw, bh))
+    pygame.draw.rect(surface, (80, 160, 255, 180), (bx, by, bw, bh), 1)
 
 
 # ── HUD ───────────────────────────────────────────────────────────────────────
+# Per-session cached renders that only rebuild when their inputs change.
+_hud_banner_surf  = None   # rendered banner Surface
+_hud_banner_bg    = None   # solid-bg Surface for banner
+_hud_minimap_lbl  = None   # "MINIMAP" label Surface
+_hud_detail_bg    = None   # reusable bg strip for ship detail
+
+
 def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
              fps, screen_w, screen_h, player_orders):
-    font_sm  = pygame.font.SysFont("monospace", 14)
-    font_med = pygame.font.SysFont("monospace", 16)
+    global _hud_banner_surf, _hud_banner_bg, _hud_minimap_lbl, _hud_detail_bg
+
+    _ensure_hud_surfaces()
+    font_sm, font_med, font_banner = _fonts()
 
     team_col   = TEAM_COLORS[player_team]
     enemy_team = 1 - player_team
 
-    friendly = [s for s in ai_characters if s.team == player_team and s.alive]
-    enemy    = [s for s in ai_characters if s.team == enemy_team  and s.alive]
-    f_carr   = sum(1 for s in friendly if isinstance(s, Carrier))
-    e_carr   = sum(1 for s in enemy   if isinstance(s, Carrier))
-
-    # ── Top-left status panel ─────────────────────────────────────────────────
-    lines = [
-        f"FPS: {fps:.0f}",
-        "",
-        f"YOUR FLEET:  {len(friendly):3d} ships  ({f_carr} carriers)",
-        f"ENEMY FLEET: {len(enemy):3d} ships  ({e_carr} carriers)",
-        "",
-        f"SELECTED: {len(selected_ships)} ship{'s' if len(selected_ships) != 1 else ''}",
-        f"ORDERS ACTIVE: {len(player_orders)}",
-    ]
-    panel_w = 290
-    panel_h = len(lines) * 18 + 14
-    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-    panel.fill((0, 0, 0, 155))
-    # Team colour strip on left edge
-    pygame.draw.rect(panel, (*team_col, 200), (0, 0, 4, panel_h))
-    for i, line in enumerate(lines):
-        if i == 2:
-            col = team_col
-        elif i == 3:
-            col = TEAM_COLORS[enemy_team]
-        elif i == 5 and selected_ships:
-            col = (220, 220, 100)
+    f_count = e_count = f_carr = e_carr = 0
+    for s in ai_characters:
+        if not s.alive:
+            continue
+        if s.team == player_team:
+            f_count += 1
+            if isinstance(s, Carrier):
+                f_carr += 1
         else:
-            col = (160, 160, 180)
-        panel.blit(font_sm.render(line, True, col), (10, 7 + i * 18))
+            e_count += 1
+            if isinstance(s, Carrier):
+                e_carr += 1
+
+    # ── Top-left status panel (reuse pre-allocated Surface) ───────────────────
+    panel   = _HUD_PANEL
+    panel_h = panel.get_height()
+    panel.fill((0, 0, 0, 155))
+    pygame.draw.rect(panel, (*team_col, 200), (0, 0, 4, panel_h))
+    lines = [
+        (f"FPS: {fps:.0f}",                                              (160, 160, 180)),
+        ("",                                                              (160, 160, 180)),
+        (f"YOUR FLEET:  {f_count:3d} ships  ({f_carr} carriers)",        team_col),
+        (f"ENEMY FLEET: {e_count:3d} ships  ({e_carr} carriers)",        TEAM_COLORS[enemy_team]),
+        ("",                                                              (160, 160, 180)),
+        (f"SELECTED: {len(selected_ships)} ship{'s' if len(selected_ships) != 1 else ''}",
+         (220, 220, 100) if selected_ships else (160, 160, 180)),
+        (f"ORDERS ACTIVE: {len(player_orders)}",                         (160, 160, 180)),
+    ]
+    for i, (line, col) in enumerate(lines):
+        if line:
+            panel.blit(font_sm.render(line, True, col), (10, 7 + i * 18))
     screen.blit(panel, (8, 8))
 
     # ── Selected ship detail (bottom centre) ──────────────────────────────────
@@ -695,71 +754,69 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
             type_str += "   [HOLDING]"
         if all(s.hold_fire for s in selected_ships):
             type_str += "   [HOLD FIRE]"
-        detail = font_med.render(type_str, True, (220, 220, 100))
-        dx     = screen_w // 2 - detail.get_width() // 2
-        bg     = pygame.Surface((detail.get_width() + 20, 28), pygame.SRCALPHA)
-        bg.fill((0, 0, 0, 160))
-        screen.blit(bg,    (dx - 10, screen_h - 46))
-        screen.blit(detail, (dx, screen_h - 42))
+        detail  = font_med.render(type_str, True, (220, 220, 100))
+        dw      = detail.get_width()
+        dx      = screen_w // 2 - dw // 2
+        if _hud_detail_bg is None or _hud_detail_bg.get_width() < dw + 20:
+            _hud_detail_bg = pygame.Surface((dw + 20, 28), pygame.SRCALPHA)
+        _hud_detail_bg.fill((0, 0, 0, 160))
+        screen.blit(_hud_detail_bg, (dx - 10, screen_h - 46))
+        screen.blit(detail,         (dx,       screen_h - 42))
 
-    # ── Controls hint (bottom-left) ───────────────────────────────────────────
-    hints = [
-        "LMB: Select   Shift+LMB: Add/Remove",
-        "Drag LMB: Box select   Ctrl+A: All",
-        "RMB: Move/Follow/Attack   A+RMB: Attack-move",
-        "Shift+RMB: Queue   Ctrl+1-9: Group   H: Hold   F: Hold fire   Tab: Toggle HUD",
-    ]
-    hint_y = screen_h - len(hints) * 16 - 8
-    for i, h in enumerate(hints):
-        surf = font_sm.render(h, True, (80, 80, 100))
+    # ── Controls hints (pre-rendered, static) ─────────────────────────────────
+    hint_y = screen_h - len(_HUD_HINTS) * 16 - 8
+    for i, surf in enumerate(_HUD_HINTS):
         screen.blit(surf, (8, hint_y + i * 16))
 
-    # ── Minimap ───────────────────────────────────────────────────────────────
+    # ── Minimap (reuse pre-allocated Surface) ─────────────────────────────────
     mm_w, mm_h = 180, 120
     mm_x = screen_w - mm_w - 10
     mm_y = 10
-    mm   = pygame.Surface((mm_w, mm_h), pygame.SRCALPHA)
+    mm   = _HUD_MM
     mm.fill((0, 0, 0, 170))
     pygame.draw.rect(mm, (50, 50, 70), (0, 0, mm_w, mm_h), 1)
 
-    def to_mm(wx, wy):
-        return (int(wx / WORLD_W * mm_w), int(wy / WORLD_H * mm_h))
-
+    mm_sx = mm_w / WORLD_W
+    mm_sy = mm_h / WORLD_H
     sel_ids = {id(s) for s in selected_ships}
+    t0_col  = TEAM_COLORS[0]
+    t1_col  = TEAM_COLORS[1]
+    t0_dim  = (t0_col[0] >> 1, t0_col[1] >> 1, t0_col[2] >> 1)
+    t1_dim  = (t1_col[0] >> 1, t1_col[1] >> 1, t1_col[2] >> 1)
     for ship in ai_characters:
         if not ship.alive:
             continue
-        col = TEAM_COLORS[ship.team]
-        if ship.team != player_team:
-            col = tuple(c // 2 for c in col)
+        mx2 = int((ship.wx + ship.width  * 0.5) * mm_sx)
+        my2 = int((ship.wy + ship.height * 0.5) * mm_sy)
         if id(ship) in sel_ids:
             col = (255, 255, 100)
-        mx2, my2 = to_mm(ship.wx + ship.width / 2, ship.wy + ship.height / 2)
-        r = 3 if isinstance(ship, Carrier) else 1
-        pygame.draw.circle(mm, col, (mx2, my2), r)
+        elif ship.team == player_team:
+            col = t0_col if player_team == 0 else t1_col
+        else:
+            col = t0_dim if player_team != 0 else t1_dim
+        pygame.draw.circle(mm, col, (mx2, my2), 3 if isinstance(ship, Carrier) else 1)
 
-    # Camera viewport rect on minimap — sized to the world area actually
-    # visible on screen, so it shrinks/grows as the player zooms in/out.
-    vp_x, vp_y = to_mm(camera.x, camera.y)
-    visible_w  = camera.screen_width  / camera.zoom
-    visible_h  = camera.screen_height / camera.zoom
-    vp_w2 = max(1, int(visible_w / WORLD_W * mm_w))
-    vp_h2 = max(1, int(visible_h / WORLD_H * mm_h))
+    vp_x  = int(camera.x * mm_sx)
+    vp_y  = int(camera.y * mm_sy)
+    vp_w2 = max(1, int(camera.screen_width  / camera.zoom * mm_sx))
+    vp_h2 = max(1, int(camera.screen_height / camera.zoom * mm_sy))
     pygame.draw.rect(mm, (120, 120, 160), (vp_x, vp_y, vp_w2, vp_h2), 1)
-
     screen.blit(mm, (mm_x, mm_y))
-    label = font_sm.render("MINIMAP", True, (80, 80, 110))
-    screen.blit(label, (mm_x + 4, mm_y + mm_h + 2))
 
-    # ── Team banner (top-centre) ───────────────────────────────────────────────
-    font_banner = pygame.font.SysFont("impact", 22)
-    banner_text = f"{TEAM_NAMES[player_team]}  vs  {TEAM_NAMES[enemy_team]}"
-    banner_surf = font_banner.render(banner_text, True, team_col)
-    bx = screen_w // 2 - banner_surf.get_width() // 2
-    bg2 = pygame.Surface((banner_surf.get_width() + 20, 30), pygame.SRCALPHA)
-    bg2.fill((0, 0, 0, 140))
-    screen.blit(bg2,         (bx - 10, 8))
-    screen.blit(banner_surf, (bx, 12))
+    if _hud_minimap_lbl is None:
+        _hud_minimap_lbl = font_sm.render("MINIMAP", True, (80, 80, 110))
+    screen.blit(_hud_minimap_lbl, (mm_x + 4, mm_y + mm_h + 2))
+
+    # ── Team banner (cached, never changes mid-game) ───────────────────────────
+    if _hud_banner_surf is None:
+        banner_text      = f"{TEAM_NAMES[player_team]}  vs  {TEAM_NAMES[enemy_team]}"
+        _hud_banner_surf = font_banner.render(banner_text, True, team_col)
+        bw               = _hud_banner_surf.get_width() + 20
+        _hud_banner_bg   = pygame.Surface((bw, 30), pygame.SRCALPHA)
+        _hud_banner_bg.fill((0, 0, 0, 140))
+    bx = screen_w // 2 - _hud_banner_surf.get_width() // 2
+    screen.blit(_hud_banner_bg,  (bx - 10, 8))
+    screen.blit(_hud_banner_surf, (bx, 12))
 
 
 # ── Quit confirmation ────────────────────────────────────────────────────────
