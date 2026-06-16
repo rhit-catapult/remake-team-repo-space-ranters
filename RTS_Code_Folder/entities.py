@@ -787,9 +787,10 @@ class AICharacter(Entity):
             else:
                 if self.fleet_leader is not None and not self.fleet_leader.alive:
                     self.fleet_leader = None   # leader destroyed — go independent
-                # Not yet deployed: hold at the spawn point instead of
-                # wandering off to a random patrol waypoint.
-                self._movement_override = None if self.deployed else self.home_pos
+                # No task assigned (no order, no commander push): patrol the
+                # home solar system on the waypoint loop instead of holding
+                # still or wandering off across the whole map.
+                self._movement_override = None
             return
 
         # ── Positional tactics: don't let lone ships overextend ───────────
@@ -1563,10 +1564,10 @@ class Carrier(AICharacter):
             self._movement_override = (cx + dx * 700, cy + dy * 700)
         else:
             self.combat_state       = 'patrol'
-            # Not yet deployed: hold at the spawn point. Once deployed and
-            # no threat nearby, leave the override clear so the commander's
-            # rally-point order (applied after update_combat) takes effect.
-            self._movement_override = None if self.deployed else self.home_pos
+            # No task assigned: patrol the home solar system on the waypoint
+            # loop. Leave the override clear so a commander rally-point order
+            # (applied after update_combat) can still take over when given.
+            self._movement_override = None
 
         # AA guns fire at enemies that get within AA_RANGE
         self._aim_and_fire(dt, cx, cy, all_ships, lasers)

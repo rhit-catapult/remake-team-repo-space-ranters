@@ -427,16 +427,24 @@ def _team_spawn_center(team):
     return (WORLD_W * frac, WORLD_H * 0.5)
 
 
+SYSTEM_PATROL_RADIUS = 5500.0   # idle fleets patrol within this distance of their home star
+
+
 def _make_waypoints(team=None):
     if team is None:
         return [(random.randint(200, WORLD_W - 200),
                  random.randint(200, WORLD_H - 200)) for _ in range(5)]
-    cx, cy = _team_spawn_center(team)
-    spawn = (max(200, min(WORLD_W - 200, cx + random.uniform(-500, 500))),
-             max(200, min(WORLD_H - 200, cy + random.uniform(-1600, 1600))))
-    rest  = [(random.randint(200, WORLD_W - 200),
-              random.randint(200, WORLD_H - 200)) for _ in range(4)]
-    return [spawn] + rest
+    # Idle ships have no task yet — keep their patrol loop inside the home
+    # solar system instead of wandering across the whole map.
+    star_x, star_y = _team_star_position(team)
+
+    def _point_in_system():
+        angle  = random.uniform(0, math.tau)
+        radius = random.uniform(0, SYSTEM_PATROL_RADIUS)
+        return (max(200, min(WORLD_W - 200, star_x + math.cos(angle) * radius)),
+                max(200, min(WORLD_H - 200, star_y + math.sin(angle) * radius)))
+
+    return [_point_in_system() for _ in range(5)]
 
 
 def _team_star_position(team):
