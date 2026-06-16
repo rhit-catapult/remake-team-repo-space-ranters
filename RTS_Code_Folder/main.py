@@ -36,6 +36,7 @@ import pygame
 from camera import Camera
 from entities import AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer
 from commander import AICommander
+from neural_commander import NeuralCommander
 
 # ── Display ───────────────────────────────────────────────────────────────────
 SCREEN_W, SCREEN_H = 1000, 800
@@ -709,6 +710,52 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
     screen.blit(banner_surf, (bx, 12))
 
 
+# ── Quit confirmation ────────────────────────────────────────────────────────
+def _quit_confirm_rects(screen):
+    sw, sh = screen.get_size()
+    btn_w, btn_h = 170, 56
+    bx0 = sw // 2 - btn_w // 2
+    by  = sh // 2 + 40
+    return pygame.Rect(bx0, by, btn_w, btn_h)
+
+
+def _draw_quit_confirm(screen, elapsed, mouse_pos):
+    """Dim + freeze the battle behind a paused 'closing the window' notice.
+    Returns resume_rect for click hit-testing."""
+    sw, sh = screen.get_size()
+    overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 170))
+    screen.blit(overlay, (0, 0))
+
+    font_title = pygame.font.SysFont("impact", 36)
+    font_sub   = pygame.font.SysFont("monospace", 15)
+    font_btn   = pygame.font.SysFont("impact", 26)
+
+    title = font_title.render("GAME PAUSED", True, (230, 230, 240))
+    screen.blit(title, title.get_rect(center=(sw // 2, sh // 2 - 60)))
+
+    sub = font_sub.render("Close the window again (titlebar X) to quit to desktop.",
+                           True, (160, 160, 180))
+    screen.blit(sub, sub.get_rect(center=(sw // 2, sh // 2 - 18)))
+
+    resume_rect = _quit_confirm_rects(screen)
+    hov_resume  = resume_rect.collidepoint(mouse_pos)
+    pulse       = 0.6 + 0.4 * math.sin(elapsed * 4.0)
+
+    bg_resume  = (35, 45, 70) if hov_resume else (16, 20, 32)
+    rim_resume = tuple(min(255, int(c * pulse))
+                        for c in ((150, 180, 230) if hov_resume else (70, 80, 110)))
+    pygame.draw.rect(screen, bg_resume,  resume_rect, border_radius=10)
+    pygame.draw.rect(screen, rim_resume, resume_rect, 3, border_radius=10)
+    lbl_resume = font_btn.render("RESUME", True, (215, 222, 235))
+    screen.blit(lbl_resume, lbl_resume.get_rect(center=resume_rect.center))
+
+    hint = font_sub.render("Esc / click RESUME to keep playing", True, (110, 115, 135))
+    screen.blit(hint, hint.get_rect(center=(sw // 2, resume_rect.bottom + 30)))
+
+    return resume_rect
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     pygame.init()
@@ -732,9 +779,11 @@ def main():
         c = own_carriers[0]
         camera.follow(c.wx + c.width / 2, c.wy + c.height / 2)
 
-    # ── Enemy commander: strategic AI controlling the other team's fleet ──────
+    # ── Enemy commander: trained neural network controlling the other team's
+    #    fleet (falls back to the rule-based AICommander if no trained
+    #    weights are found — see neural_commander.MODEL_PATH) ─────────────────
     enemy_team = 1 - player_team
-    commander  = AICommander(
+    commander  = NeuralCommander(
         team=enemy_team, enemy_team=player_team,
         own_spawn=_team_spawn_center(enemy_team),
         enemy_spawn=_team_spawn_center(player_team),
@@ -762,6 +811,46 @@ def main():
     cmd_markers: list = []
     cmd_marker_t = 0.0  # countdown to remove markers
 
+    # Quit-confirmation overlay — closing the window mid-battle pauses the
+    # game instead of exiting instantly; closing it again actually quits.
+    quit_confirm = False
+    resume_button = None
+
+    def render_frame():
+        screen_w, screen_h = screen.get_size()
+        vp_w = max(1, int(screen_w / camera.zoom))
+        vp_h = max(1, int(screen_h / camera.zoom))
+        vp_rect = pygame.Rect(int(camera.x), int(camera.y), vp_w, vp_h)
+        vp_rect = vp_rect.clip(world_surf.get_rect())
+        if vp_rect.width > 0 and vp_rect.height > 0:
+            region = world_surf.subsurface(vp_rect)
+            pygame.transform.scale(region, (screen_w, screen_h), screen)
+
+        for ship in ai_characters:
+            ship.draw(screen, camera)
+
+        for laser in lasers:
+            laser.draw(screen, camera)
+
+        for exp in explosions:
+            exp.draw(screen, camera)
+
+        # Selection rings
+        for ship in selected_ships:
+            draw_selection_ring(screen, camera, ship, elapsed, player_team)
+
+        # Command destination markers
+        marker_col = TEAM_COLORS[player_team]
+        for wx2, wy2 in cmd_markers:
+            draw_command_marker(screen, camera, wx2, wy2, elapsed, marker_col)
+
+        # Box-select overlay (while LMB held)
+        if lmb_start is not None:
+            draw_select_box(screen, lmb_start, pygame.mouse.get_pos())
+
+        draw_hud(screen, camera, ai_characters, player_team,
+                 selected_ships, clock.get_fps(), screen_w, screen_h, player_orders)
+
     while True:
         dt        = clock.tick(FPS) / 1000.0
         elapsed  += dt
@@ -770,10 +859,26 @@ def main():
         camera.screen_height = screen_h
         mx, my = pygame.mouse.get_pos()
 
+        # ── Quit confirmation: battle is paused, only the dialog responds ──────
+        if quit_confirm:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    quit_confirm = False
+                if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                        and resume_button and resume_button.collidepoint(event.pos)):
+                    quit_confirm = False
+
+            render_frame()
+            resume_button = _draw_quit_confirm(screen, elapsed, (mx, my))
+            pygame.display.flip()
+            continue
+
         # ── Events ────────────────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
+                quit_confirm = True
 
             # ── Keyboard ──────────────────────────────────────────────────────
             if event.type == pygame.KEYDOWN:
@@ -953,6 +1058,14 @@ def main():
                 rmb_start = None
                 rmb_drag  = False
 
+        if quit_confirm:
+            # Window close requested this frame — drop straight into the
+            # paused dialog without advancing simulation or drawing the HUD.
+            render_frame()
+            resume_button = _draw_quit_confirm(screen, elapsed, (mx, my))
+            pygame.display.flip()
+            continue
+
         # ── Update ────────────────────────────────────────────────────────────
         for ship in ai_characters:
             ship.update(dt)
@@ -1078,39 +1191,7 @@ def main():
         camera.clamp(WORLD_W, WORLD_H)
 
         # ── Draw ──────────────────────────────────────────────────────────────
-        vp_w = max(1, int(screen_w / camera.zoom))
-        vp_h = max(1, int(screen_h / camera.zoom))
-        vp_rect = pygame.Rect(int(camera.x), int(camera.y), vp_w, vp_h)
-        vp_rect = vp_rect.clip(world_surf.get_rect())
-        if vp_rect.width > 0 and vp_rect.height > 0:
-            region = world_surf.subsurface(vp_rect)
-            pygame.transform.scale(region, (screen_w, screen_h), screen)
-
-        for ship in ai_characters:
-            ship.draw(screen, camera)
-
-        for laser in lasers:
-            laser.draw(screen, camera)
-
-        for exp in explosions:
-            exp.draw(screen, camera)
-
-        # Selection rings
-        for ship in selected_ships:
-            draw_selection_ring(screen, camera, ship, elapsed, player_team)
-
-        # Command destination markers
-        marker_col = TEAM_COLORS[player_team]
-        for wx2, wy2 in cmd_markers:
-            draw_command_marker(screen, camera, wx2, wy2, elapsed, marker_col)
-
-        # Box-select overlay (while LMB held)
-        if lmb_start is not None:
-            draw_select_box(screen, lmb_start, (mx, my))
-
-        draw_hud(screen, camera, ai_characters, player_team,
-                 selected_ships, clock.get_fps(), screen_w, screen_h, player_orders)
-
+        render_frame()
         pygame.display.flip()
 
 
