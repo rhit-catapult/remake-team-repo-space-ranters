@@ -245,6 +245,13 @@ class AICharacter(Entity):
         'retreat': (230,  30,  30),
     }
 
+    # ── Team-level strategic state ──────────────────────────────────────────
+    # Recomputed once per frame by main.py (cheap aggregate stats), then read
+    # by every ship's update_combat — avoids each ship re-scanning the fleet.
+    team_strength_ratio: dict = {0: 1.0, 1: 1.0}   # own_hp_total / enemy_hp_total per team
+    team_focus_fleet:    dict = {0: None, 1: None}  # team -> enemy fleet_leader to mass fire on
+    REGROUP_ALLY_RADIUS = 700.0   # consider a ship "isolated" with no allies within this range
+
     # Turret local positions as (lx_frac, ly_frac) — fractions of half-width / half-height.
     # Applied after rotating by the ship angle, so turrets move with the hull.
     _TURRET_LAYOUTS = {
@@ -347,6 +354,10 @@ class AICharacter(Entity):
         self.fleet_leader     = None              # reference to the carrier/lead ship of this fleet
         self.fleet_offset     = (0.0, 0.0)        # formation slot offset from leader centre
         self.fleet_stray_dist = FLEET_STRAY_DIST  # per-ship leash; escorts get a tighter value
+
+        # Player command state — set/cleared by main.py in response to player orders
+        self.player_hold = False   # True: hold this exact spot (still aims/fires)
+        self.hold_fire   = False   # True: weapons disabled regardless of targets in range
 
     @property
     def target(self) -> tuple[float, float]:
@@ -471,10 +482,21 @@ class AICharacter(Entity):
                 self._sep_ay += (cy - oy) / d * strength
 
         # ── Retreat: break off when critically damaged ────────────────────
-        if self.hp / self.max_hp < RETREAT_HP_RATIO:
+        # Adaptive aggression: a team that's winning presses the advantage
+        # (retreats later); a losing team breaks off earlier to preserve hulls.
+        team_ratio        = self.team_strength_ratio.get(self.team, 1.0)
+        retreat_threshold = RETREAT_HP_RATIO * max(0.6, min(1.8, 1.0 / max(0.01, team_ratio)))
+        if self.hp / self.max_hp < retreat_threshold:
             self.combat_state       = 'retreat'
             self._current_target    = None
             self._movement_override = self._calc_retreat_pos(cx, cy, all_ships)
+            self._aim_and_fire(dt, cx, cy, all_ships, lasers)
+            return
+
+        # ── Player hold: stay locked in place, still fight back ───────────
+        if self.player_hold:
+            self.combat_state       = 'engage' if self._has_target else 'patrol'
+            self._movement_override = (cx, cy)
             self._aim_and_fire(dt, cx, cy, all_ships, lasers)
             return
 
@@ -486,6 +508,8 @@ class AICharacter(Entity):
             if ship.team == self.team and ship.alive and ship._current_target is not None:
                 tid = id(ship._current_target)
                 target_counts[tid] = target_counts.get(tid, 0) + 1
+
+        focus_fleet = self.team_focus_fleet.get(self.team)
 
         best_score  = float('inf')
         best_target = None
@@ -508,6 +532,9 @@ class AICharacter(Entity):
                 lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
                 lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
                 score -= max(0.0, (1000.0 - math.hypot(ex - lcx, ey - lcy)) * 0.8)
+            # Fleet commander: mass fire on whichever enemy fleet is weakest
+            if focus_fleet is not None and ship.fleet_leader is focus_fleet:
+                score -= 300.0
             if score < best_score:
                 best_score  = score
                 best_target = ship
@@ -528,6 +555,29 @@ class AICharacter(Entity):
                 if self.fleet_leader is not None and not self.fleet_leader.alive:
                     self.fleet_leader = None   # leader destroyed — go independent
                 self._movement_override = None
+            return
+
+        # ── Positional tactics: don't let lone ships overextend ───────────
+        # If we're still some way from the target and no ally is nearby,
+        # regroup toward the fleet slot first rather than charging in solo.
+        target_dist = math.hypot(
+            (best_target.wx + best_target.width / 2) - cx,
+            (best_target.wy + best_target.height / 2) - cy,
+        )
+        isolated = target_dist > self.attack_range * 0.8 and not any(
+            ship is not self and ship.team == self.team and ship.alive
+            and math.hypot((ship.wx + ship.width / 2) - cx,
+                            (ship.wy + ship.height / 2) - cy) < self.REGROUP_ALLY_RADIUS
+            for ship in all_ships
+        )
+        if (isolated and self.fleet_leader is not None and self.fleet_leader is not self
+                and self.fleet_leader.alive):
+            self.combat_state = 'patrol'
+            lcx = self.fleet_leader.wx + self.fleet_leader.width  / 2
+            lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
+            self._movement_override = (lcx + self.fleet_offset[0],
+                                       lcy + self.fleet_offset[1])
+            self._aim_and_fire(dt, cx, cy, all_ships, lasers)
             return
 
         # ── Set state and movement destination based on role ──────────────
@@ -629,6 +679,9 @@ class AICharacter(Entity):
     def _aim_and_fire(self, dt: float, cx: float, cy: float,
                       all_ships: list, lasers: list) -> None:
         """Aim weapons at the nearest in-range enemy and fire laser beams (instant hit)."""
+        if self.hold_fire:
+            self._has_target = False
+            return
         best_dist   = self.attack_range
         best_target = None
         for ship in all_ships:
@@ -1214,9 +1267,15 @@ class Carrier(AICharacter):
                 nearest_dist  = d
                 nearest_enemy = ship
 
-        # Signal allied ships when the carrier is threatened
-        SAFE_DIST = ATTACK_RANGE * 1.8
-        self._needs_defense = (nearest_enemy is not None and nearest_dist < SAFE_DIST)
+        # Signal allied ships when the carrier is threatened — either an enemy
+        # is closing in, or our hull is already badly damaged and needs escorts
+        # to fall back and cover us regardless of where the threat currently is.
+        SAFE_DIST    = ATTACK_RANGE * 1.8
+        hp_ratio      = self.hp / self.max_hp
+        self._needs_defense = (
+            (nearest_enemy is not None and nearest_dist < SAFE_DIST)
+            or hp_ratio < 0.5
+        )
 
         # Movement: hang back at a safe distance — never charge the front line
         if nearest_enemy is not None and nearest_dist < SAFE_DIST:
@@ -1243,18 +1302,29 @@ class Carrier(AICharacter):
         enemy_detected    = nearest_enemy is not None and nearest_dist < ATTACK_RANGE * 2.2
         under_direct_fire = nearest_dist < AA_RANGE * 1.5
 
+        # Reserve doctrine: only commit a fraction of the squadron proactively
+        # while quiet, so a surprise attack always has fresh fighters to scramble.
+        # The reserve cap lifts entirely once a real threat is detected.
+        deploy_cap = self.MAX_FIGHTERS if enemy_detected else int(self.MAX_FIGHTERS * 0.6)
+
         self._deploy_timer -= dt
 
-        if enemy_detected and live_count < self.MAX_FIGHTERS:
+        if enemy_detected and live_count < deploy_cap:
             # Emergency scramble: bypass timer when enemy is dangerously close
             # and we have fewer than half our fighters up
             if under_direct_fire and live_count < self.MAX_FIGHTERS // 2:
                 self._queue_fighter(cx, cy)
+                # Desperate situation (badly damaged + swarmed): launch in pairs
+                if hp_ratio < 0.4:
+                    self._queue_fighter(cx, cy)
                 self._deploy_timer = self.DEPLOY_INTERVAL * 0.4
 
             elif self._deploy_timer <= 0:
                 self._queue_fighter(cx, cy)
                 self._deploy_timer = self.DEPLOY_INTERVAL
+        elif not enemy_detected and live_count < deploy_cap and self._deploy_timer <= 0:
+            self._queue_fighter(cx, cy)
+            self._deploy_timer = self.DEPLOY_INTERVAL
 
     def _queue_fighter(self, cx: float, cy: float) -> None:
         """Push a spawn request onto the queue; main.py creates the Fighter."""
@@ -1448,6 +1518,11 @@ class Destroyer(AICharacter):
                       all_ships: list, lasers: list) -> None:
         self._fire_flash = max(0.0, self._fire_flash - dt)
         self._cooldown   = max(0.0, self._cooldown   - dt)
+
+        if self.hold_fire:
+            self._has_target = False
+            self._charge     = max(0.0, self._charge - dt * 0.5)
+            return
 
         # ── Main cannon — prefers large ships (carriers > capitals > frigates) ──
         best_score  = float('inf')

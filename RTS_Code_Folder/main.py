@@ -8,11 +8,19 @@ Controls (in-game):
   LMB click        — select a friendly ship
   LMB drag         — box-select multiple ships
   Shift + LMB      — add / remove from selection
-  RMB click        — move order (empty space) or attack order (enemy ship)
+  RMB click        — move order (formation-aware, empty space)
+  RMB click ally   — follow order (escort a friendly ship in formation)
+  RMB click enemy  — attack order
+  A + RMB click    — attack-move (advance, engage anything met en route)
+  Shift + RMB      — queue the order instead of replacing the current one
   RMB drag         — pan camera
   Scroll wheel     — zoom in / out
   Ctrl+A           — select all your ships
-  Escape           — deselect all
+  Ctrl + 1-9       — assign selected ships to control group
+  1-9              — recall control group (Shift adds to selection)
+  H                — hold position (stay put, keep firing)
+  F                — toggle hold fire
+  Escape           — deselect all / clear orders
 """
 
 import sys
@@ -257,38 +265,136 @@ def _draw_menu(screen, stars, elapsed, hovered):
         lbl = font_btn.render(name, True, text_cols[i])
         screen.blit(lbl, lbl.get_rect(center=rect.center))
 
+    # Controls-layout button
+    ctrl_w, ctrl_h = 280, 46
+    ctrl_rect = pygame.Rect(sw // 2 - ctrl_w // 2, by + btn_h + 40, ctrl_w, ctrl_h)
+    is_ctrl_hov = (hovered == 'controls')
+    ctrl_bg  = (30, 35, 55) if is_ctrl_hov else (14, 16, 28)
+    ctrl_rim = (130, 150, 200) if is_ctrl_hov else (70, 80, 110)
+    pygame.draw.rect(screen, ctrl_bg,  ctrl_rect, border_radius=10)
+    pygame.draw.rect(screen, ctrl_rim, ctrl_rect, 2, border_radius=10)
+    font_ctrl = pygame.font.SysFont("monospace", 18, bold=True)
+    ctrl_lbl  = font_ctrl.render("VIEW CONTROL LAYOUT", True, (190, 200, 225))
+    screen.blit(ctrl_lbl, ctrl_lbl.get_rect(center=ctrl_rect.center))
+
     # Quit hint
     hint = font_hint.render("ESC — Quit", True, (60, 60, 80))
-    screen.blit(hint, hint.get_rect(center=(sw // 2, by + btn_h + 30)))
+    screen.blit(hint, hint.get_rect(center=(sw // 2, ctrl_rect.bottom + 24)))
 
-    return btn_rects
+    return btn_rects, ctrl_rect
+
+
+CONTROLS_TEXT = [
+    ("LMB click",    "select a friendly ship"),
+    ("LMB drag",     "box-select multiple ships"),
+    ("Shift + LMB",  "add / remove from selection"),
+    ("RMB click",    "move order (formation-aware, empty space)"),
+    ("RMB on ally",  "follow order (escort that ship in formation)"),
+    ("RMB on enemy", "attack order"),
+    ("A + RMB",      "attack-move (advance, engage anything met en route)"),
+    ("Shift + RMB",  "queue the order instead of replacing it"),
+    ("RMB drag",     "pan camera"),
+    ("Scroll wheel", "zoom in / out"),
+    ("Ctrl+A",       "select all your ships"),
+    ("Ctrl + 1-9",   "assign selected ships to a control group"),
+    ("1-9",          "recall control group (Shift adds to selection)"),
+    ("H",            "hold position — stay put, keep firing"),
+    ("F",            "toggle hold fire"),
+    ("Escape",       "deselect all / clear orders"),
+]
+
+
+def _draw_controls_overlay(screen, stars, elapsed):
+    sw, sh = screen.get_size()
+    screen.fill((2, 4, 14))
+
+    for s in stars:
+        s[1] = (s[1] + s[3] * 0.0003) % 1.0
+        sx = int(s[0] * sw)
+        sy = int(s[1] * sh)
+        bright = int(s[2] * 200 + 55)
+        r = 1 if s[2] < 0.7 else 2
+        pygame.draw.circle(screen, (bright, bright, bright), (sx, sy), r)
+
+    font_title = pygame.font.SysFont("impact", 36)
+    font_key   = pygame.font.SysFont("monospace", 15, bold=True)
+    font_desc  = pygame.font.SysFont("monospace", 15)
+    font_hint  = pygame.font.SysFont("monospace", 13)
+
+    title = font_title.render("CONTROL LAYOUT", True, (200, 220, 255))
+    screen.blit(title, title.get_rect(center=(sw // 2, 36)))
+
+    row_h   = max(22, min(28, (sh - 110) // len(CONTROLS_TEXT)))
+    panel_w = min(760, sw - 60)
+    panel_h = len(CONTROLS_TEXT) * row_h + 20
+    panel_x = sw // 2 - panel_w // 2
+    panel_y = 64
+
+    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    panel.fill((10, 14, 28, 200))
+    pygame.draw.rect(panel, (70, 80, 110), (0, 0, panel_w, panel_h), 2, border_radius=10)
+
+    key_col_w = 170
+    for i, (key, desc) in enumerate(CONTROLS_TEXT):
+        y = 10 + i * row_h
+        key_surf  = font_key.render(key, True, (120, 200, 255))
+        desc_surf = font_desc.render(desc, True, (200, 205, 220))
+        panel.blit(key_surf,  (20, y))
+        panel.blit(desc_surf, (key_col_w, y))
+
+    screen.blit(panel, (panel_x, panel_y))
+
+    hint = font_hint.render("Click anywhere or press ESC to return", True, (120, 130, 160))
+    screen.blit(hint, hint.get_rect(center=(sw // 2, min(sh - 16, panel_y + panel_h + 22))))
 
 
 def run_menu(screen, clock):
     """Show the main menu; return chosen team index (0=blue, 1=red)."""
     stars   = _make_menu_stars()
     elapsed = 0.0
+    showing_controls = False
     while True:
         dt = clock.tick(60) / 1000.0
         elapsed += dt
         mx, my = pygame.mouse.get_pos()
 
+        if showing_controls:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    showing_controls = False
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    showing_controls = False
+            _draw_controls_overlay(screen, stars, elapsed)
+            pygame.display.flip()
+            continue
+
         hovered = None
+        clicked_ctrl = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 pygame.quit(); sys.exit()
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                btn_rects = _draw_menu(screen, stars, elapsed, hovered)
+                btn_rects, ctrl_rect = _draw_menu(screen, stars, elapsed, hovered)
                 for i, rect in enumerate(btn_rects):
                     if rect.collidepoint(event.pos):
                         return i   # 0 = blue, 1 = red
+                if ctrl_rect.collidepoint(event.pos):
+                    clicked_ctrl = True
 
-        btn_rects = _draw_menu(screen, stars, elapsed, hovered)
+        if clicked_ctrl:
+            showing_controls = True
+            continue
+
+        btn_rects, ctrl_rect = _draw_menu(screen, stars, elapsed, hovered)
         for i, rect in enumerate(btn_rects):
             if rect.collidepoint((mx, my)):
                 hovered = i
+        if ctrl_rect.collidepoint((mx, my)):
+            hovered = 'controls'
 
         pygame.display.flip()
 
@@ -351,6 +457,37 @@ def setup_game():
             ship.fleet_offset = (math.cos(angle) * radius, math.sin(angle) * radius)
 
     return ai_characters
+
+
+# ── Team strategy (fleet-level "commander" layer) ───────────────────────────
+def update_team_strategy(ai_characters):
+    """Recompute per-team aggregate stats once a frame and publish them onto
+    AICharacter as shared class state, so every ship's update_combat can read
+    them cheaply instead of each ship re-scanning the whole fleet."""
+    team_hp = {0: 0.0, 1: 0.0}
+    fleets:  dict = {}   # id(leader) -> [leader, total_hp]
+    for s in ai_characters:
+        if not s.alive:
+            continue
+        team_hp[s.team] += s.hp
+        leader = s.fleet_leader
+        if leader is not None and leader.alive:
+            entry = fleets.setdefault(id(leader), [leader, 0.0])
+            entry[1] += s.hp
+
+    AICharacter.team_strength_ratio = {
+        0: team_hp[0] / max(1.0, team_hp[1]),
+        1: team_hp[1] / max(1.0, team_hp[0]),
+    }
+
+    focus = {0: None, 1: None}
+    for team in (0, 1):
+        enemy_team = 1 - team
+        candidates = [v for v in fleets.values() if v[0].team == enemy_team]
+        if candidates:
+            weakest = min(candidates, key=lambda v: v[1])
+            focus[team] = weakest[0]
+    AICharacter.team_focus_fleet = focus
 
 
 # ── RTS helpers ───────────────────────────────────────────────────────────────
@@ -477,6 +614,10 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
             t = type(s).__name__
             types[t] = types.get(t, 0) + 1
         type_str = "  ".join(f"{v}× {k}" for k, v in types.items())
+        if all(s.player_hold for s in selected_ships):
+            type_str += "   [HOLDING]"
+        if all(s.hold_fire for s in selected_ships):
+            type_str += "   [HOLD FIRE]"
         detail = font_med.render(type_str, True, (220, 220, 100))
         dx     = screen_w // 2 - detail.get_width() // 2
         bg     = pygame.Surface((detail.get_width() + 20, 28), pygame.SRCALPHA)
@@ -488,8 +629,8 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
     hints = [
         "LMB: Select   Shift+LMB: Add/Remove",
         "Drag LMB: Box select   Ctrl+A: All",
-        "RMB click: Move/Attack   RMB drag: Pan",
-        "Scroll: Zoom   ESC: Deselect",
+        "RMB: Move/Follow/Attack   A+RMB: Attack-move",
+        "Shift+RMB: Queue   Ctrl+1-9: Group   H: Hold   F: Hold fire",
     ]
     hint_y = screen_h - len(hints) * 16 - 8
     for i, h in enumerate(hints):
@@ -566,8 +707,14 @@ def main():
 
     # ── RTS state ─────────────────────────────────────────────────────────────
     selected_ships: list = []
-    # player_orders: id(ship) → {'ship_ref', 'type': 'move'|'attack', 'pos'|'target'}
+    # player_orders: id(ship) → [order, ...] queue. order = {'ship_ref', 'type', ...}
+    # types: 'move' {'pos'}, 'attack' {'target'}, 'attack_move' {'pos'}, 'follow' {'target','offset'}
     player_orders:  dict = {}
+    control_groups: dict = {}   # 1-9 → list of ships
+    DIGIT_KEYS = {
+        pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4, pygame.K_5: 5,
+        pygame.K_6: 6, pygame.K_7: 7, pygame.K_8: 8, pygame.K_9: 9,
+    }
 
     lmb_start  = None   # LMB press position for click / box-select
     rmb_start  = None   # RMB press position for click vs. drag detection
@@ -594,13 +741,45 @@ def main():
 
             # ── Keyboard ──────────────────────────────────────────────────────
             if event.type == pygame.KEYDOWN:
+                mods = pygame.key.get_mods()
                 if event.key == pygame.K_ESCAPE:
                     selected_ships.clear()
                     player_orders.clear()
                     cmd_markers.clear()
-                if event.key == pygame.K_a and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                if event.key == pygame.K_a and (mods & pygame.KMOD_CTRL):
                     selected_ships = [s for s in ai_characters
                                       if s.team == player_team and s.alive]
+
+                # ── Control groups: Ctrl+1-9 assign, 1-9 recall ────────────────
+                if event.key in DIGIT_KEYS:
+                    grp = DIGIT_KEYS[event.key]
+                    if mods & pygame.KMOD_CTRL:
+                        if selected_ships:
+                            control_groups[grp] = list(selected_ships)
+                    else:
+                        members = [s for s in control_groups.get(grp, []) if s.alive]
+                        if members:
+                            control_groups[grp] = members
+                            if mods & pygame.KMOD_SHIFT:
+                                for s in members:
+                                    if s not in selected_ships:
+                                        selected_ships.append(s)
+                            else:
+                                selected_ships = list(members)
+
+                # ── Hold position: stay put, keep firing ───────────────────────
+                if event.key == pygame.K_h and selected_ships:
+                    new_hold = not all(s.player_hold for s in selected_ships)
+                    for s in selected_ships:
+                        s.player_hold = new_hold
+                        if new_hold:
+                            player_orders.pop(id(s), None)
+
+                # ── Toggle hold fire ─────────────────────────────────────────
+                if event.key == pygame.K_f and selected_ships:
+                    new_hf = not all(s.hold_fire for s in selected_ships)
+                    for s in selected_ships:
+                        s.hold_fire = new_hf
 
             # ── Zoom ──────────────────────────────────────────────────────────
             if event.type == pygame.MOUSEWHEEL:
@@ -674,46 +853,62 @@ def main():
                     drag_orig = event.pos
 
             if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
-                if rmb_start is not None and not rmb_drag:
+                if rmb_start is not None and not rmb_drag and selected_ships:
                     # Short click → issue command
                     cx_s, cy_s = rmb_start
-                    target_enemy = get_ship_at(
-                        [s for s in ai_characters
-                         if s.team != player_team and s.alive],
-                        camera, cx_s, cy_s,
-                    )
-                    wx, wy = camera.screen_to_world(cx_s, cy_s)
-                    n = len(selected_ships)
-                    cmd_markers.clear()
+                    mods       = pygame.key.get_mods()
+                    queueing   = bool(mods & pygame.KMOD_SHIFT)
+                    attack_move_mod = pygame.key.get_pressed()[pygame.K_a]
 
-                    for i, ship in enumerate(selected_ships):
+                    clicked = get_ship_at(ai_characters, camera, cx_s, cy_s)
+                    target_enemy = clicked if (clicked is not None
+                                                and clicked.team != player_team) else None
+                    target_ally  = clicked if (clicked is not None
+                                                and clicked.team == player_team
+                                                and clicked not in selected_ships) else None
+                    wx, wy = camera.screen_to_world(cx_s, cy_s)
+
+                    if not queueing:
+                        cmd_markers.clear()
+                        for s in selected_ships:
+                            s.player_hold = False
+
+                    # Formation centroid — moves/attack-moves keep relative spacing
+                    cxs = [s.wx + s.width / 2 for s in selected_ships]
+                    cys = [s.wy + s.height / 2 for s in selected_ships]
+                    cen_x = sum(cxs) / len(cxs)
+                    cen_y = sum(cys) / len(cys)
+
+                    for s, scx, scy in zip(selected_ships, cxs, cys):
                         if target_enemy is not None:
-                            player_orders[id(ship)] = {
-                                'ship_ref': ship,
-                                'type':     'attack',
-                                'target':   target_enemy,
+                            order = {'ship_ref': s, 'type': 'attack', 'target': target_enemy}
+                        elif target_ally is not None:
+                            order = {
+                                'ship_ref': s, 'type': 'follow', 'target': target_ally,
+                                'offset': (scx - (target_ally.wx + target_ally.width / 2),
+                                           scy - (target_ally.wy + target_ally.height / 2)),
                             }
                         else:
-                            # Fan the ships around the click point
-                            if n > 1:
-                                angle = i * (math.tau / n)
-                                r     = 180 + (n // 4) * 60
-                                ox    = math.cos(angle) * r
-                                oy    = math.sin(angle) * r
-                            else:
-                                ox, oy = 0.0, 0.0
-                            dest = (wx + ox, wy + oy)
-                            player_orders[id(ship)] = {
-                                'ship_ref': ship,
-                                'type':     'move',
+                            dest = (wx + (scx - cen_x), wy + (scy - cen_y))
+                            order = {
+                                'ship_ref': s,
+                                'type':     'attack_move' if attack_move_mod else 'move',
                                 'pos':      dest,
                             }
                             cmd_markers.append(dest)
 
+                        if queueing:
+                            player_orders.setdefault(id(s), []).append(order)
+                        else:
+                            player_orders[id(s)] = [order]
+
                     if target_enemy is not None:
-                        # Show marker at the enemy's current position
                         tx = target_enemy.wx + target_enemy.width  / 2
                         ty = target_enemy.wy + target_enemy.height / 2
+                        cmd_markers.append((tx, ty))
+                    elif target_ally is not None:
+                        tx = target_ally.wx + target_ally.width  / 2
+                        ty = target_ally.wy + target_ally.height / 2
                         cmd_markers.append((tx, ty))
 
                     cmd_marker_t = 2.5   # show markers for 2.5 seconds
@@ -725,32 +920,70 @@ def main():
         for ship in ai_characters:
             ship.update(dt)
 
+        update_team_strategy(ai_characters)
+
         alive_before = {id(s): s.alive for s in ai_characters}
         for ship in ai_characters:
             ship.update_combat(dt, ai_characters, lasers)
 
-        # Apply player orders — override combat AI's movement destination
+        # Apply player orders — override combat AI's movement destination.
+        # Each ship has a queue; the head order is "current" and advances
+        # (pops) once satisfied, automatically starting the next queued one.
         to_clear = []
-        for ship_id, order in player_orders.items():
-            ref = order['ship_ref']
-            if not ref.alive:
+        for ship_id, queue in player_orders.items():
+            if not queue:
                 to_clear.append(ship_id)
                 continue
+            ref = queue[0]['ship_ref']
+            if not ref.alive or ref.player_hold:
+                to_clear.append(ship_id)
+                continue
+
+            order    = queue[0]
+            finished = False
+
             if order['type'] == 'move':
                 px, py = order['pos']
                 ref._movement_override = (px, py)
                 cx2 = ref.wx + ref.width  / 2
                 cy2 = ref.wy + ref.height / 2
                 if math.hypot(cx2 - px, cy2 - py) < 200:
-                    to_clear.append(ship_id)          # arrived — release the order
+                    finished = True                   # arrived — release the order
+
+            elif order['type'] == 'attack_move':
+                px, py = order['pos']
+                if ref._current_target is None:
+                    # No contact yet (or contact cleared) — keep advancing
+                    ref._movement_override = (px, py)
+                    cx2 = ref.wx + ref.width  / 2
+                    cy2 = ref.wy + ref.height / 2
+                    if math.hypot(cx2 - px, cy2 - py) < 200:
+                        finished = True
+                # else: an enemy was spotted — leave the combat AI's own
+                # engage/flank movement in place until the fight is resolved.
+
             elif order['type'] == 'attack':
                 tgt = order['target']
                 if not tgt.alive:
-                    to_clear.append(ship_id)
+                    finished = True
                 else:
                     tx2 = tgt.wx + tgt.width  / 2
                     ty2 = tgt.wy + tgt.height / 2
                     ref._movement_override = (tx2, ty2)   # keep chasing
+
+            elif order['type'] == 'follow':
+                tgt = order['target']
+                if not tgt.alive:
+                    finished = True
+                else:
+                    ox, oy = order['offset']
+                    ref._movement_override = (tgt.wx + tgt.width  / 2 + ox,
+                                               tgt.wy + tgt.height / 2 + oy)
+
+            if finished:
+                queue.pop(0)
+                if not queue:
+                    to_clear.append(ship_id)
 
         for ship_id in to_clear:
             player_orders.pop(ship_id, None)
