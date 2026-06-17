@@ -1,2 +1,14 @@
+# Space Ranters – runtime & optional dependencies
+#
+# Required to play:
+#   Python 3.10+
+#   pip install pygame-ce
+#
+# Required only for neural commander training (neural_commander.py, train_commander.py):
+#   pip install torch
+#   PyTorch install varies by platform/CUDA version – see https://pytorch.org/get-started/locally/
 
 pygame-ce>=2.5.7
+
+# Optional – only needed if using the neural AI commander
+torch>=2.0.0

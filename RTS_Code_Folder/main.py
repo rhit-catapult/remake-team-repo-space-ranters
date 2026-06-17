@@ -68,14 +68,48 @@ TEAM_COLORS = [
 TEAM_NAMES = ["BLUE COMMAND", "RED COMMAND"]
 
 # ── Resource / build system ───────────────────────────────────────────────────
-STARTING_RESOURCES = 200
+# Planet  → material mapping (see MinerShip._PLANET_YIELDS / _ASTEROID_YIELDS)
+# home    → Iron + Silicon + Copper
+# rocky   → Iron + Nickel
+# water   → Copper + Ice
+# gas     → Fuel + Helium-3
+# asteroid→ Titanium + Platinum  (finite, high rate)
+# glowing → Crystal  + Uranium   (finite, high rate)
+
+ALL_MATERIALS = [
+    'iron', 'nickel', 'copper', 'silicon', 'ice',
+    'helium3', 'fuel', 'titanium', 'platinum', 'crystal', 'uranium',
+]
+
+MATERIAL_ABBREV = {
+    'iron':     'Fe',   'nickel':   'Ni',  'copper':  'Cu',  'silicon': 'Si',
+    'ice':      'H₂O', 'helium3': 'He³', 'fuel': 'Fu',
+    'titanium': 'Ti',   'platinum': 'Pt',  'crystal': 'Cr',  'uranium': 'U',
+}
+
+MATERIAL_COLOR = {
+    'iron':     (180, 130,  80),
+    'nickel':   (160, 160, 150),
+    'copper':   (210, 140,  40),
+    'silicon':  (100, 200, 100),
+    'ice':      (160, 220, 255),
+    'helium3':  (255, 160,  80),
+    'fuel':     (220, 200,  70),
+    'titanium': (150, 200, 230),
+    'platinum': (220, 220, 200),
+    'crystal':  (190, 100, 255),
+    'uranium':  ( 80, 255, 100),
+}
+
+STARTING_MATERIALS = {'iron': 80}
 
 SHIP_COSTS = {
-    'MinerShip':   25,
-    'CargoShip':   40,
-    'AICharacter': 50,
-    'Destroyer':   130,
-    'Carrier':     300,
+    'MinerShip':   {'iron': 10, 'nickel': 5},
+    'CargoShip':   {'iron': 15, 'copper': 8},
+    'AICharacter': {'iron': 30, 'copper': 12, 'silicon': 8},
+    'Destroyer':   {'iron': 50, 'copper': 20, 'titanium': 15, 'fuel': 20},
+    'Carrier':     {'iron': 80, 'copper': 30, 'titanium': 35,
+                    'platinum': 10, 'crystal': 15, 'fuel': 45},
 }
 
 _BUILD_MENU_ROWS = [
@@ -109,7 +143,7 @@ def _ensure_hud_surfaces():
     if _HUD_PANEL is not None:
         return
     font_sm, _, _ = _fonts()
-    _HUD_PANEL = pygame.Surface((290, 14 + 11 * 18), pygame.SRCALPHA)
+    _HUD_PANEL = pygame.Surface((300, 14 + 16 * 18), pygame.SRCALPHA)
     _HUD_MM    = pygame.Surface((180, 120), pygame.SRCALPHA)
     hints = [
         "LMB: Select   Shift+LMB: Add/Remove",
@@ -791,7 +825,7 @@ _hud_detail_bg    = None   # reusable bg strip for ship detail
 
 def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
              fps, screen_w, screen_h, player_orders,
-             team_resources=None, team_special_resources=None):
+             team_materials=None):
     global _hud_banner_surf, _hud_banner_bg, _hud_minimap_lbl, _hud_detail_bg
 
     _ensure_hud_surfaces()
@@ -818,23 +852,46 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
     panel_h = panel.get_height()
     panel.fill((0, 0, 0, 155))
     pygame.draw.rect(panel, (*team_col, 200), (0, 0, 4, panel_h))
-    res_val  = int(team_resources.get(player_team, 0))          if team_resources          else 0
-    spec_val = int(team_special_resources.get(player_team, 0)) if team_special_resources else 0
-    lines = [
-        (f"FPS: {fps:.0f}",                                              (160, 160, 180)),
-        (f"RESOURCES: {res_val}",                                        (100, 230, 120)),
-        (f"SPECIAL:   {spec_val}",                                       (190, 100, 255)),
-        ("",                                                              (160, 160, 180)),
-        (f"YOUR FLEET:  {f_count:3d} ships  ({f_carr} carriers)",        team_col),
-        (f"ENEMY FLEET: {e_count:3d} ships  ({e_carr} carriers)",        TEAM_COLORS[enemy_team]),
-        ("",                                                              (160, 160, 180)),
+
+    mat = team_materials.get(player_team, {}) if team_materials else {}
+
+    # FPS
+    panel.blit(font_sm.render(f"FPS: {fps:.0f}", True, (160, 160, 180)), (10, 7))
+
+    # Materials in two columns: left col x=10, right col x=150
+    _MAT_ROWS = [
+        ('iron',     'nickel'),
+        ('copper',   'silicon'),
+        ('ice',      'helium3'),
+        ('fuel',     'titanium'),
+        ('platinum', 'crystal'),
+        ('uranium',  None),
+    ]
+    y = 25
+    for left, right in _MAT_ROWS:
+        for ci, mn in enumerate([left, right]):
+            if mn is None:
+                continue
+            v   = int(mat.get(mn, 0))
+            txt = f"{MATERIAL_ABBREV.get(mn, mn)}:{v}"
+            col = MATERIAL_COLOR.get(mn, (180, 180, 180))
+            panel.blit(font_sm.render(txt, True, col), (10 + ci * 140, y))
+        y += 18
+
+    # Fleet / selection info
+    y += 4
+    for line, col in [
+        (f"YOUR FLEET:  {f_count:3d} ({f_carr} carriers)", team_col),
+        (f"ENEMY FLEET: {e_count:3d} ({e_carr} carriers)", TEAM_COLORS[enemy_team]),
+        ("", (0, 0, 0)),
         (f"SELECTED: {len(selected_ships)} ship{'s' if len(selected_ships) != 1 else ''}",
          (220, 220, 100) if selected_ships else (160, 160, 180)),
-        (f"ORDERS ACTIVE: {len(player_orders)}",                         (160, 160, 180)),
-    ]
-    for i, (line, col) in enumerate(lines):
+        (f"ORDERS ACTIVE: {len(player_orders)}", (160, 160, 180)),
+    ]:
         if line:
-            panel.blit(font_sm.render(line, True, col), (10, 7 + i * 18))
+            panel.blit(font_sm.render(line, True, col), (10, y))
+        y += 18
+
     screen.blit(panel, (8, 8))
 
     # ── Selected ship detail (bottom centre) ──────────────────────────────────
@@ -848,14 +905,75 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
             type_str += "   [HOLDING]"
         if selected_ships and all(getattr(s, 'hold_fire', False) for s in selected_ships):
             type_str += "   [HOLD FIRE]"
+
+        # ── Miner resource info ───────────────────────────────────────────────
+        _PTYPE_RESOURCE = {
+            'rocky': 'Iron', 'home': 'Iron+Copper',
+            'water': 'Copper', 'gas': 'Fuel',
+            'asteroid': 'Titanium', 'glowing': 'Crystal',
+        }
+        _RESOURCE_COL = {
+            'Iron':        (180, 130,  80),
+            'Iron+Copper': (200, 135,  60),
+            'Copper':      (210, 140,  40),
+            'Titanium':    (150, 200, 230),
+            'Crystal':     (190, 100, 255),
+            'Fuel':        (220, 200,  70),
+        }
+        miners_sel = [s for s in selected_ships if type(s).__name__ == 'MinerShip']
+        miner_info_surfs = []
+        if miners_sel:
+            if len(miners_sel) == 1:
+                m = miners_sel[0]
+                ptype = getattr(getattr(m, '_landed_planet', None), 'planet_type', None)
+                if m.state == 'landed' and ptype:
+                    res_name = _PTYPE_RESOURCE.get(ptype, ptype.title())
+                    col      = _RESOURCE_COL.get(res_name, (200, 200, 200))
+                    label    = f"Mining: {res_name}  ({ptype} planet)"
+                    miner_info_surfs.append((font_sm.render(label, True, col), col))
+                elif m.state == 'to_planet':
+                    ptype = getattr(getattr(m, '_target', None), 'planet_type', None)
+                    res_name = _PTYPE_RESOURCE.get(ptype, '?') if ptype else '?'
+                    col      = _RESOURCE_COL.get(res_name, (160, 160, 160))
+                    miner_info_surfs.append((font_sm.render(f"En route → {res_name}", True, col), col))
+                else:
+                    miner_info_surfs.append((font_sm.render("Idle", True, (140, 140, 140)), (140, 140, 140)))
+            else:
+                # Summarise across multiple miners
+                counts: dict = {}
+                idle = 0
+                for m in miners_sel:
+                    ptype = getattr(getattr(m, '_landed_planet', None), 'planet_type', None)
+                    if not ptype and m.state == 'to_planet':
+                        ptype = getattr(getattr(m, '_target', None), 'planet_type', None)
+                    if ptype:
+                        res_name = _PTYPE_RESOURCE.get(ptype, ptype.title())
+                        counts[res_name] = counts.get(res_name, 0) + 1
+                    else:
+                        idle += 1
+                parts = [f"{n}×{r}" for r, n in counts.items()]
+                if idle:
+                    parts.append(f"{idle}×idle")
+                col = (180, 180, 180)
+                miner_info_surfs.append((font_sm.render("Mining: " + "  ".join(parts), True, col), col))
+
+        # Draw: type line then optional miner line
+        has_miner_line = bool(miner_info_surfs)
+        base_y  = screen_h - (68 if has_miner_line else 46)
         detail  = font_med.render(type_str, True, (220, 220, 100))
         dw      = detail.get_width()
-        dx      = screen_w // 2 - dw // 2
-        if _hud_detail_bg is None or _hud_detail_bg.get_width() < dw + 20:
-            _hud_detail_bg = pygame.Surface((dw + 20, 28), pygame.SRCALPHA)
+        mw      = max((s.get_width() for s, _ in miner_info_surfs), default=0)
+        bg_w    = max(dw, mw) + 20
+        bg_h    = 28 + (20 if has_miner_line else 0)
+        dx      = screen_w // 2 - bg_w // 2
+        old_sz = _hud_detail_bg.get_size() if _hud_detail_bg else (0, 0)
+        if _hud_detail_bg is None or old_sz[0] < bg_w or old_sz[1] < bg_h:
+            _hud_detail_bg = pygame.Surface((bg_w, bg_h), pygame.SRCALPHA)
         _hud_detail_bg.fill((0, 0, 0, 160))
-        screen.blit(_hud_detail_bg, (dx - 10, screen_h - 46))
-        screen.blit(detail,         (dx,       screen_h - 42))
+        screen.blit(_hud_detail_bg, (dx, base_y))
+        screen.blit(detail, (screen_w // 2 - dw // 2, base_y + 4))
+        for i, (surf, _) in enumerate(miner_info_surfs):
+            screen.blit(surf, (screen_w // 2 - surf.get_width() // 2, base_y + 26 + i * 18))
 
     # ── Controls hints (pre-rendered, static) ─────────────────────────────────
     hint_y = screen_h - len(_HUD_HINTS) * 16 - 8
@@ -961,29 +1079,94 @@ def _draw_quit_confirm(screen, elapsed, mouse_pos):
 
 # ── Resource / build helpers ──────────────────────────────────────────────────
 
-def _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships, team_resources):
-    """Queue a ship for the AI team when it has enough resources."""
-    constructor = constructors_by_team.get(enemy_team)
+def _ai_assign_miners(team, miners, asteroids, planets_by_team):
+    """Send idle miners to best targets: richest asteroids first, then home planets.
+    Spreads miners across targets instead of piling onto one."""
+    idle = [m for m in miners if m.team == team and m.alive and m.state == 'idle']
+    if not idle:
+        return
+
+    # Count how many miners are already committed to each target
+    load: dict = {}
+    for m in miners:
+        if m.team == team and m.alive and m.state in ('to_planet', 'landed'):
+            tgt = getattr(m, '_landed_planet', None)
+            if tgt is not None:
+                load[id(tgt)] = load.get(id(tgt), 0) + 1
+
+    rich_asts  = sorted(
+        [a for a in asteroids if hasattr(a, 'resources') and a.resources > 30],
+        key=lambda a: a.resources, reverse=True,
+    )
+    own_planets = list(planets_by_team.get(team, []))
+    candidates  = rich_asts + own_planets
+    if not candidates:
+        return
+
+    for m in idle:
+        best = min(candidates, key=lambda t: load.get(id(t), 0))
+        m.send_to(best)
+        load[id(best)] = load.get(id(best), 0) + 1
+
+
+def _ai_queue_build(team, constructors_by_team, miners, cargo_ships,
+                    team_materials, asteroids=None, planets_by_team=None):
+    """Queue the best ship for the AI given current resources and game phase."""
+    constructor = constructors_by_team.get(team)
     if constructor is None or len(constructor.build_queue) >= 3:
         return
-    res        = team_resources.get(enemy_team, 0.0)
-    own_miners = sum(1 for m in miners if m.team == enemy_team and m.alive)
-    own_cargo  = sum(1 for c in cargo_ships if c.team == enemy_team and c.alive)
-    if own_miners < 3 and res >= SHIP_COSTS['MinerShip']:
-        constructor.queue_build('MinerShip')
-        team_resources[enemy_team] -= SHIP_COSTS['MinerShip']
-    elif own_cargo < max(1, own_miners) and res >= SHIP_COSTS['CargoShip']:
-        constructor.queue_build('CargoShip')
-        team_resources[enemy_team] -= SHIP_COSTS['CargoShip']
-    elif res >= SHIP_COSTS['Carrier']:
-        constructor.queue_build('Carrier')
-        team_resources[enemy_team] -= SHIP_COSTS['Carrier']
-    elif res >= SHIP_COSTS['Destroyer']:
-        constructor.queue_build('Destroyer')
-        team_resources[enemy_team] -= SHIP_COSTS['Destroyer']
-    elif res >= SHIP_COSTS['AICharacter']:
-        constructor.queue_build('AICharacter')
-        team_resources[enemy_team] -= SHIP_COSTS['AICharacter']
+    mat = team_materials[team]
+
+    own_miners = sum(1 for m in miners if m.team == team and m.alive)
+    own_cargo  = sum(1 for c in cargo_ships if c.team == team and c.alive)
+
+    # How many targets are actually worth mining right now?
+    rich_asts   = [a for a in (asteroids or []) if hasattr(a, 'resources') and a.resources > 30]
+    own_planets = (planets_by_team or {}).get(team, [])
+    max_useful  = len(own_planets) + min(len(rich_asts), 2)
+    miner_target = max(2, min(max_useful, 5))
+
+    iron     = mat.get('iron',     0)
+    copper   = mat.get('copper',   0)
+    titanium = mat.get('titanium', 0)
+    crystal  = mat.get('crystal',  0)
+    fuel     = mat.get('fuel',     0)
+
+    def can_afford(stype):
+        return all(mat.get(m, 0) >= c for m, c in SHIP_COSTS.get(stype, {}).items())
+
+    def can_afford_safely(stype):
+        # Require 2× cost in stock so building doesn't drain the economy dry
+        return all(mat.get(m, 0) >= c * 2 for m, c in SHIP_COSTS.get(stype, {}).items())
+
+    def build(stype):
+        constructor.queue_build(stype)
+        for m, c in SHIP_COSTS.get(stype, {}).items():
+            mat[m] -= c
+
+    # ── Phase 1: establish economy ────────────────────────────────────────────
+    if own_miners < miner_target and can_afford('MinerShip'):
+        build('MinerShip'); return
+
+    if own_cargo < max(1, own_miners) and can_afford('CargoShip'):
+        build('CargoShip'); return
+
+    # ── Phase 2: combat build, gated by having surplus resources ─────────────
+    if titanium >= 30 and crystal >= 10 and fuel >= 40 and can_afford_safely('Carrier'):
+        build('Carrier'); return
+
+    if titanium >= 15 and copper >= 25 and can_afford_safely('Destroyer'):
+        build('Destroyer'); return
+
+    if copper >= 15 and can_afford('AICharacter'):
+        build('AICharacter'); return
+
+    # ── Phase 3: reinvest in economy when combat ships aren't yet affordable ──
+    if iron >= 60 and own_miners < 5 and can_afford('MinerShip'):
+        build('MinerShip'); return
+
+    if own_cargo < own_miners and can_afford('CargoShip'):
+        build('CargoShip')
 
 
 def get_asteroid_at(asteroids, camera, sx, sy):
@@ -1019,18 +1202,31 @@ def _get_constructor_at_screen(solar_entities, camera, sx, sy):
     return None
 
 
-def draw_build_menu(screen, constructor, team_resources, player_team):
-    """Draw the build queue menu.  Returns list of (ship_type, pygame.Rect)."""
+_QUEUE_DISPLAY_NAMES = {
+    'AICharacter': 'Frigate', 'MinerShip': 'Miner',
+    'CargoShip': 'Cargo', 'Destroyer': 'Destroyer', 'Carrier': 'Carrier',
+}
+
+
+def draw_build_menu(screen, constructor, team_materials, player_team):
+    """Draw build menu + live queue panel.
+
+    Returns (option_rects, cancel_rects, clear_rect):
+      option_rects  — list of (ship_type, pygame.Rect)  build buttons
+      cancel_rects  — list of (queue_index, pygame.Rect) per-item X buttons
+      clear_rect    — pygame.Rect for the Clear All button (or None)
+    """
     sw, sh   = screen.get_size()
-    res      = int(team_resources.get(player_team, 0))
+    mat      = team_materials.get(player_team, {}) if team_materials else {}
     team_col = TEAM_COLORS[player_team]
 
     font_title = pygame.font.SysFont("impact",    20)
-    font_row   = pygame.font.SysFont("monospace", 14)
+    font_row   = pygame.font.SysFont("monospace", 12)
 
-    row_h   = 40
-    panel_w = 300
-    panel_h = 34 + len(_BUILD_MENU_ROWS) * row_h + 28
+    # ── Left panel: build options ────────────────────────────────────────────
+    row_h    = 48
+    panel_w  = 340
+    panel_h  = 82 + len(_BUILD_MENU_ROWS) * row_h + 28
     px = sw - panel_w - 14
     py = sh // 2 - panel_h // 2
 
@@ -1039,40 +1235,115 @@ def draw_build_menu(screen, constructor, team_resources, player_team):
     pygame.draw.rect(bg, (*team_col, 220), (0, 0, panel_w, panel_h), 2, border_radius=8)
     screen.blit(bg, (px, py))
 
-    # Header
-    hdr  = font_title.render("CONSTRUCTOR", True, team_col)
+    hdr = font_title.render("CONSTRUCTOR", True, team_col)
     screen.blit(hdr, (px + 10, py + 7))
-    res_s = font_row.render(f"Resources: {res}", True, (100, 230, 120))
-    screen.blit(res_s, (px + panel_w - res_s.get_width() - 10, py + 10))
+
+    # Stock strip (two rows)
+    stock_rows = [
+        [('iron','Fe'), ('nickel','Ni'), ('copper','Cu'), ('silicon','Si'), ('ice','H₂O'), ('helium3','He³')],
+        [('fuel','Fu'), ('titanium','Ti'), ('platinum','Pt'), ('crystal','Cr'), ('uranium','U')],
+    ]
+    sx0, sy0 = px + 8, py + 30
+    for ri, row in enumerate(stock_rows):
+        sx = sx0
+        for mn, abbr in row:
+            v   = int(mat.get(mn, 0))
+            col = MATERIAL_COLOR.get(mn, (180, 180, 180))
+            s   = font_row.render(f"{abbr}:{v}", True, col)
+            screen.blit(s, (sx, sy0 + ri * 16))
+            sx += s.get_width() + 8
 
     # Build rows
     option_rects = []
-    y = py + 34
-    for ship_type, label, cost in _BUILD_MENU_ROWS:
-        can = res >= cost
+    y = py + 82
+    for ship_type, label, costs in _BUILD_MENU_ROWS:
+        can  = all(mat.get(m, 0) >= v for m, v in costs.items())
         rect = pygame.Rect(px + 6, y, panel_w - 12, row_h - 4)
         pygame.draw.rect(screen, (28, 48, 80) if can else (28, 18, 18), rect, border_radius=5)
         pygame.draw.rect(screen, (70, 140, 220) if can else (55, 35, 35), rect, 1, border_radius=5)
-        lbl  = font_row.render(label, True, (215, 215, 215) if can else (90, 70, 70))
-        cost_s = font_row.render(str(cost), True, (90, 220, 100) if can else (150, 70, 70))
-        screen.blit(lbl,    (rect.x + 8,  rect.centery - lbl.get_height()  // 2))
-        screen.blit(cost_s, (rect.right - cost_s.get_width() - 8,
-                             rect.centery - cost_s.get_height() // 2))
+        lbl = font_row.render(label, True, (215, 215, 215) if can else (90, 70, 70))
+        screen.blit(lbl, (rect.x + 8, rect.y + 4))
+        cx = rect.x + 8
+        for m, amt in costs.items():
+            have     = mat.get(m, 0) >= amt
+            chip_col = MATERIAL_COLOR.get(m, (180, 180, 180)) if have else (200, 70, 70)
+            chip     = font_row.render(f"{MATERIAL_ABBREV.get(m, m)}:{amt}", True, chip_col)
+            screen.blit(chip, (cx, rect.y + 24))
+            cx += chip.get_width() + 8
         option_rects.append((ship_type, rect))
         y += row_h
-
-    # Queue display
-    if constructor.build_queue:
-        q_names = {'AICharacter': 'Frigate', 'MinerShip': 'Miner',
-                   'Destroyer': 'Destroyer', 'Carrier': 'Carrier'}
-        q_str = " → ".join(q_names.get(t, t) for t in constructor.build_queue[:5])
-        qs = font_row.render(f"Queue: {q_str}", True, (160, 160, 200))
-        screen.blit(qs, (px + 10, y + 4))
 
     hint = font_row.render("[ESC] or click elsewhere to close", True, (70, 70, 95))
     screen.blit(hint, (px + 10, py + panel_h - 18))
 
-    return option_rects
+    # ── Right panel: build queue ─────────────────────────────────────────────
+    q_item_h  = 26
+    q_panel_w = 160
+    max_shown = 10
+    queue     = constructor.build_queue
+    n_shown   = min(len(queue), max_shown)
+    q_panel_h = 34 + n_shown * q_item_h + (28 if queue else 0) + 28
+    qpx = px - q_panel_w - 8
+    qpy = py
+
+    qbg = pygame.Surface((q_panel_w, q_panel_h), pygame.SRCALPHA)
+    qbg.fill((6, 10, 22, 225))
+    pygame.draw.rect(qbg, (*team_col, 180), (0, 0, q_panel_w, q_panel_h), 2, border_radius=8)
+    screen.blit(qbg, (qpx, qpy))
+
+    qhdr = font_title.render("QUEUE", True, team_col)
+    screen.blit(qhdr, (qpx + 10, qpy + 7))
+
+    cancel_rects = []
+    clear_rect   = None
+
+    if not queue:
+        empty = font_row.render("(empty)", True, (80, 80, 100))
+        screen.blit(empty, (qpx + 10, qpy + 34))
+    else:
+        qy = qpy + 34
+        for i, stype in enumerate(queue[:max_shown]):
+            label = _QUEUE_DISPLAY_NAMES.get(stype, stype)
+            # Number badge
+            num_s = font_row.render(f"{i+1}.", True, (120, 120, 140))
+            screen.blit(num_s, (qpx + 6, qy + 5))
+            # Label
+            name_s = font_row.render(label, True, (210, 210, 210))
+            screen.blit(name_s, (qpx + 24, qy + 5))
+            # X cancel button
+            x_rect = pygame.Rect(qpx + q_panel_w - 24, qy + 3, 18, 18)
+            mx, my = pygame.mouse.get_pos()
+            x_hover = x_rect.collidepoint(mx, my)
+            pygame.draw.rect(screen, (140, 40, 40) if x_hover else (80, 28, 28),
+                             x_rect, border_radius=3)
+            pygame.draw.rect(screen, (220, 80, 80), x_rect, 1, border_radius=3)
+            x_lbl = font_row.render("✕", True, (255, 120, 120))
+            screen.blit(x_lbl, (x_rect.x + 3, x_rect.y + 2))
+            cancel_rects.append((i, x_rect))
+            # Divider
+            if i < n_shown - 1:
+                pygame.draw.line(screen, (30, 30, 50),
+                                 (qpx + 4, qy + q_item_h - 1),
+                                 (qpx + q_panel_w - 4, qy + q_item_h - 1))
+            qy += q_item_h
+
+        if len(queue) > max_shown:
+            more = font_row.render(f"+ {len(queue) - max_shown} more…", True, (80, 80, 100))
+            screen.blit(more, (qpx + 8, qy + 2))
+            qy += 18
+
+        # Clear All button
+        clear_rect = pygame.Rect(qpx + 6, qy + 4, q_panel_w - 12, 20)
+        mx, my = pygame.mouse.get_pos()
+        c_hover = clear_rect.collidepoint(mx, my)
+        pygame.draw.rect(screen, (100, 30, 30) if c_hover else (60, 18, 18),
+                         clear_rect, border_radius=4)
+        pygame.draw.rect(screen, (200, 70, 70), clear_rect, 1, border_radius=4)
+        clbl = font_row.render("Clear All", True, (255, 100, 100))
+        screen.blit(clbl, (clear_rect.x + (clear_rect.w - clbl.get_width()) // 2,
+                           clear_rect.y + 2))
+
+    return option_rects, cancel_rects, clear_rect
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1091,9 +1362,11 @@ def main():
     lasers:     list[Laser]     = []
     explosions: list[Explosion] = []
 
-    # ── Resource & mining state ────────────────────────────────────────────────
-    team_resources: dict         = {0: float(STARTING_RESOURCES), 1: float(STARTING_RESOURCES)}
-    team_special_resources: dict = {0: 0.0, 1: 0.0}
+    # ── Resource & mining state ───────────────────────────────────────────────
+    team_materials: dict = {
+        t: {mat: float(STARTING_MATERIALS.get(mat, 0)) for mat in ALL_MATERIALS}
+        for t in (0, 1)
+    }
     miners:         list       = []
     constructors_by_team       = {e.team: e for e in solar_entities if isinstance(e, Constructor)}
     planets_by_team: dict      = {}
@@ -1115,7 +1388,7 @@ def main():
                 miners[-1].asteroids = asteroids
             cargo_ships.append(CargoShip(
                 _con.wx + _con.radius, _con.wy + _con.radius,
-                _team, _con, miners, team_resources, team_special_resources,
+                _team, _con, miners, team_materials[_team],
             ))
 
     # AI team's starting miners auto-assign immediately
@@ -1128,7 +1401,9 @@ def main():
 
     constructor_menu_open          = False
     constructor_menu_ref           = None
-    _build_menu_rects: list        = []   # refreshed each frame when menu is open
+    _build_menu_rects: list        = []   # (ship_type, rect) build buttons
+    _build_cancel_rects: list      = []   # (queue_index, rect) X cancel buttons
+    _build_clear_rects: list       = []   # 0 or 1 element: the Clear All rect
     ai_build_timer                 = 5.0  # seconds until next AI build check
 
     # Start camera centred on the player team's first carrier, or the home star.
@@ -1232,11 +1507,14 @@ def main():
         if hud_visible:
             draw_hud(screen, camera, ai_characters, player_team,
                      selected_ships, clock.get_fps(), screen_w, screen_h,
-                     player_orders, team_resources, team_special_resources)
+                     player_orders, team_materials)
 
         if constructor_menu_open and constructor_menu_ref is not None:
-            _build_menu_rects[:] = draw_build_menu(
-                screen, constructor_menu_ref, team_resources, player_team)
+            _opt, _cxl, _clr = draw_build_menu(
+                screen, constructor_menu_ref, team_materials, player_team)
+            _build_menu_rects[:]   = _opt
+            _build_cancel_rects[:] = _cxl
+            _build_clear_rects[:]  = [_clr] if _clr else []
 
     while True:
         dt        = clock.tick(FPS) / 1000.0
@@ -1337,15 +1615,35 @@ def main():
 
                     if drag_dist < 8:
                         if constructor_menu_open:
-                            # Route click into the build menu
-                            for _stype, _rect in _build_menu_rects:
-                                if _rect.collidepoint(ex, ey):
-                                    _cost = SHIP_COSTS.get(_stype, 0)
-                                    if team_resources[player_team] >= _cost:
-                                        team_resources[player_team] -= _cost
-                                        constructor_menu_ref.queue_build(_stype)
-                                    break
-                            constructor_menu_open = False
+                            _clicked_menu = False
+                            # Clear All button
+                            if _build_clear_rects and _build_clear_rects[0].collidepoint(ex, ey):
+                                constructor_menu_ref.build_queue.clear()
+                                _clicked_menu = True
+                            # Per-item cancel (X) buttons — iterate in reverse so
+                            # removing by index doesn't shift earlier items
+                            if not _clicked_menu:
+                                for _qi, _qr in reversed(_build_cancel_rects):
+                                    if _qr.collidepoint(ex, ey):
+                                        if 0 <= _qi < len(constructor_menu_ref.build_queue):
+                                            constructor_menu_ref.build_queue.pop(_qi)
+                                        _clicked_menu = True
+                                        break
+                            # Build option buttons
+                            if not _clicked_menu:
+                                for _stype, _rect in _build_menu_rects:
+                                    if _rect.collidepoint(ex, ey):
+                                        _c  = SHIP_COSTS.get(_stype, {})
+                                        _pm = team_materials[player_team]
+                                        if all(_pm.get(m, 0) >= v for m, v in _c.items()):
+                                            for m, v in _c.items():
+                                                _pm[m] -= v
+                                            constructor_menu_ref.queue_build(_stype)
+                                        _clicked_menu = True
+                                        break
+                            # Only close on clicks outside all menu panels
+                            if not _clicked_menu:
+                                constructor_menu_open = False
                         else:
                             # Constructor click opens the build menu
                             _con_hit = _get_constructor_at_screen(
@@ -1643,7 +1941,7 @@ def main():
                     if _con:
                         cargo_ships.append(CargoShip(
                             sx, sy, team, _con, miners,
-                            team_resources, team_special_resources,
+                            team_materials[team],
                         ))
                     continue
 
@@ -1849,7 +2147,8 @@ def main():
         ai_build_timer -= dt
         if ai_build_timer <= 0.0:
             ai_build_timer = 6.0
-            _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships, team_resources)
+            _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships,
+                            team_materials)
             # Assign any AI miners that are still idle (planets + asteroids)
             _ai_targets = planets_by_team.get(enemy_team, []) + [
                 a for a in asteroids if hasattr(a, 'planet_type')]

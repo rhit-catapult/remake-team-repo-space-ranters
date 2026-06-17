@@ -541,9 +541,19 @@ class MinerShip(Entity):
 
     SPEED      = 310.0
     DOCK_RANGE = 300.0
-    _MINE_RATES         = {'rocky': 4.0, 'water': 2.5, 'gas': 3.5, 'home': 7.0,
-                           'asteroid': 3.5}
-    _SPECIAL_MINE_RATE  = 1.8   # glowing asteroids → special resources / sec
+
+    # Infinite-resource planet yields  {ptype: {material: rate/s}}
+    _PLANET_YIELDS = {
+        'home':  {'iron': 2.0, 'silicon': 2.0, 'copper': 1.0},
+        'rocky': {'iron': 4.0, 'nickel':  2.0},
+        'water': {'copper': 3.0, 'ice': 2.5},
+        'gas':   {'fuel': 3.5, 'helium3': 2.0},
+    }
+    # Finite asteroid yields  {ptype: {material: rate/s}}  — rates sum to total depletion rate
+    _ASTEROID_YIELDS = {
+        'asteroid': {'titanium': 8.0, 'platinum': 4.0},
+        'glowing':  {'crystal':  5.0, 'uranium':  3.0},
+    }
 
     def __init__(self, wx: float, wy: float, team: int, planets: list):
         color = (200, 235, 255) if team == 0 else (255, 210, 200)
@@ -551,8 +561,11 @@ class MinerShip(Entity):
         self.team           = team
         self.alive          = True
         self.planets        = planets
-        self.cargo          = 0.0
-        self.special_cargo  = 0.0
+        self.cargo_hold = {
+            'iron': 0.0, 'nickel': 0.0, 'copper': 0.0, 'silicon': 0.0, 'ice': 0.0,
+            'helium3': 0.0, 'fuel': 0.0, 'titanium': 0.0, 'platinum': 0.0,
+            'crystal': 0.0, 'uranium': 0.0,
+        }
         self.state          = 'idle'
         self._target        = None
         self._landed_planet = None
@@ -597,18 +610,16 @@ class MinerShip(Entity):
                 if self.drill_hp > 0:
                     self._drill_spin += 4.5 * dt
                     ptype = getattr(self._landed_planet, 'planet_type', None)
-                    rate  = (self._SPECIAL_MINE_RATE if ptype == 'glowing'
-                             else self._MINE_RATES.get(ptype, 3.0))
-                    mined = rate * dt
-                    # For finite-resource bodies (asteroids) cap and deduct
                     if hasattr(self._landed_planet, 'resources'):
-                        mined = min(mined, self._landed_planet.resources)
+                        # Finite asteroid: split total mined proportionally across yields
+                        yields     = self._ASTEROID_YIELDS.get(ptype, {})
+                        total_rate = sum(yields.values()) or 1.0
+                        mined      = min(total_rate * dt, self._landed_planet.resources)
                         self._landed_planet.resources -= mined
                         if self._landed_planet.resources <= 0:
                             self._landed_planet.alive = False
                             depleted                  = self._landed_planet
                             self._landed_planet       = None
-                            # Auto-reassign to another asteroid if in asteroid mode
                             if self._asteroid_mode and self.asteroids:
                                 next_a = next(
                                     (a for a in self.asteroids
@@ -621,10 +632,12 @@ class MinerShip(Entity):
                                     return
                             self.state = 'idle'
                             return
-                    if ptype == 'glowing':
-                        self.special_cargo += mined
+                        for mat, rate in yields.items():
+                            self.cargo_hold[mat] += mined * (rate / total_rate)
                     else:
-                        self.cargo += mined
+                        # Infinite planet: add all yields for this planet type
+                        for mat, rate in self._PLANET_YIELDS.get(ptype, {}).items():
+                            self.cargo_hold[mat] += rate * dt
             return
 
         if self.state == 'to_planet':
@@ -768,22 +781,17 @@ class MinerShip(Entity):
         pygame.draw.circle(surface, (0, 0, 0), (ix, iy), 4)
         pygame.draw.circle(surface, dot_col,   (ix, iy), 3)
 
-        # Cargo bars (stacked): amber = regular, violet = special
-        if self.cargo > 0 or self.special_cargo > 0:
-            bar_w = max(16, int(L * 2.4))
-            bx    = cx - bar_w // 2
-            by    = int(cy - math.hypot(L, W) - 9)
-            if self.cargo > 0:
-                fill_w = max(1, int(bar_w * min(self.cargo, 80.0) / 80.0))
-                pygame.draw.rect(surface, (30,  30,  30),  (bx, by, bar_w, 4))
-                pygame.draw.rect(surface, (70, 210,  90),  (bx, by, fill_w, 4))
-                pygame.draw.rect(surface, (160, 160, 160), (bx, by, bar_w, 4), 1)
-            if self.special_cargo > 0:
-                s_fill = max(1, int(bar_w * min(self.special_cargo, 40.0) / 40.0))
-                sy_bar = by + 6
-                pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 4))
-                pygame.draw.rect(surface, (180,  80, 255),  (bx, sy_bar, s_fill, 4))
-                pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 4), 1)
+        # Cargo bar: total hold fullness
+        total_cargo = sum(self.cargo_hold.values())
+        if total_cargo > 0.1:
+            _HOLD_CAP = 120.0
+            bar_w  = max(16, int(L * 2.4))
+            bx     = cx - bar_w // 2
+            by     = int(cy - math.hypot(L, W) - 9)
+            fill_w = max(1, int(bar_w * min(total_cargo, _HOLD_CAP) / _HOLD_CAP))
+            pygame.draw.rect(surface, (30,  30,  30),  (bx, by, bar_w, 4))
+            pygame.draw.rect(surface, (70, 210,  90),  (bx, by, fill_w, 4))
+            pygame.draw.rect(surface, (160, 160, 160), (bx, by, bar_w, 4), 1)
 
         # Hull health bar (shown when damaged)
         if self.hp < self.max_hp:
@@ -804,29 +812,31 @@ class CargoShip(Entity):
     then delivers them to the team's Constructor.
     """
 
-    SPEED        = 380.0
-    CARGO_CAP    = 120.0
-    LOAD_RATE    = 25.0   # resources per second drained from the miner
-    UNLOAD_RATE  = 35.0   # resources per second deposited at the constructor
-    DOCK_RANGE   = 280.0
+    SPEED       = 380.0
+    LOAD_RATE   = 25.0   # units per second drained from miner per material
+    UNLOAD_RATE = 35.0   # units per second deposited at constructor per material
+    DOCK_RANGE  = 280.0
 
-    SPECIAL_CAP = 50.0   # separate hold for special resources
+    # Per-material hold capacities; CARGO_CAP kept for draw-fill reference
+    CARGO_CAPS = {
+        'iron':     120, 'nickel':   60, 'copper':   80, 'silicon':  60,
+        'ice':       80, 'helium3':  60, 'fuel':     80, 'titanium': 60,
+        'platinum':  40, 'crystal':  50, 'uranium':  40,
+    }
+    CARGO_CAP = 120  # = CARGO_CAPS['iron'], used by draw fill
 
     def __init__(self, wx: float, wy: float, team: int,
                  constructor,
-                 miners_ref: list,         # live reference to the shared miners list
-                 resources: dict,
-                 special_resources: dict):
+                 miners_ref: list,
+                 materials: dict):   # shared ref to team_materials[team]
         color = (160, 255, 180) if team == 0 else (255, 180, 140)
         super().__init__(wx, wy, 52, 26, color)
         self.team              = team
         self.alive             = True
         self.constructor       = constructor
         self._miners_ref       = miners_ref
-        self.resources         = resources
-        self.special_resources = special_resources
-        self.cargo             = 0.0
-        self.special_cargo     = 0.0
+        self.materials  = materials
+        self.cargo_hold = {mat: 0.0 for mat in self.CARGO_CAPS}
         self.state             = 'seeking'
         self._target_miner     = None
         self.vx = self.vy         = 0.0
@@ -856,9 +866,10 @@ class CargoShip(Entity):
             best       = None
             best_cargo = 8.0
             for m in pool:
+                total_cargo = sum(getattr(m, 'cargo_hold', {}).values())
                 if (m.team == self.team and m.alive
-                        and m.state == 'landed' and m.cargo > best_cargo):
-                    best_cargo = m.cargo
+                        and m.state == 'landed' and total_cargo > best_cargo):
+                    best_cargo = total_cargo
                     best       = m
             if best is not None:
                 self._target_miner = best
@@ -885,21 +896,17 @@ class CargoShip(Entity):
             if self._target_miner is None or not self._target_miner.alive:
                 self.state = 'seeking'
                 return
-            transfer = min(self.LOAD_RATE * dt,
-                           self._target_miner.cargo,
-                           self.CARGO_CAP - self.cargo)
-            self._target_miner.cargo -= transfer
-            self.cargo               += transfer
-            # Also pull special cargo in the same trip
-            s_xfer = min(self.LOAD_RATE * dt,
-                         self._target_miner.special_cargo,
-                         self.SPECIAL_CAP - self.special_cargo)
-            self._target_miner.special_cargo -= s_xfer
-            self.special_cargo               += s_xfer
+            miner_hold = getattr(self._target_miner, 'cargo_hold', {})
+            for mat, cap in self.CARGO_CAPS.items():
+                avail = miner_hold.get(mat, 0.0)
+                xfer  = min(self.LOAD_RATE * dt, avail, cap - self.cargo_hold.get(mat, 0.0))
+                if xfer > 0:
+                    miner_hold[mat]        -= xfer
+                    self.cargo_hold[mat]   += xfer
             self._beam_active = True
-            if (self.cargo >= self.CARGO_CAP
-                    or (self._target_miner.cargo < 0.5
-                        and self._target_miner.special_cargo < 0.5)):
+            miner_empty = all(v < 0.5 for v in miner_hold.values())
+            iron_full   = self.cargo_hold.get('iron', 0) >= self.CARGO_CAPS['iron']
+            if iron_full or miner_empty:
                 self._beam_active  = False
                 self._target_miner = None
                 self.state         = 'to_constructor'
@@ -913,17 +920,16 @@ class CargoShip(Entity):
                 self.state = 'depositing'
 
         elif self.state == 'depositing':
-            transfer = min(self.UNLOAD_RATE * dt, self.cargo)
-            self.cargo -= transfer
-            self.resources[self.team] = self.resources.get(self.team, 0.0) + transfer
-            s_xfer = min(self.UNLOAD_RATE * dt, self.special_cargo)
-            self.special_cargo -= s_xfer
-            self.special_resources[self.team] = (
-                self.special_resources.get(self.team, 0.0) + s_xfer)
+            for mat in list(self.cargo_hold):
+                held = self.cargo_hold[mat]
+                if held > 0:
+                    xfer = min(self.UNLOAD_RATE * dt, held)
+                    self.cargo_hold[mat] -= xfer
+                    self.materials[mat]   = self.materials.get(mat, 0.0) + xfer
             self._unload_beam_active = True
-            if self.cargo < 0.5 and self.special_cargo < 0.5:
-                self.cargo               = 0.0
-                self.special_cargo       = 0.0
+            if all(v < 0.5 for v in self.cargo_hold.values()):
+                for mat in self.cargo_hold:
+                    self.cargo_hold[mat] = 0.0
                 self._unload_beam_active = False
                 self.state               = 'seeking'
 
@@ -1013,7 +1019,7 @@ class CargoShip(Entity):
             return (int(cx + lx * cos_a - ly * sin_a),
                     int(cy + lx * sin_a + ly * cos_a))
 
-        fill   = min(self.cargo / self.CARGO_CAP, 1.0)
+        fill   = min(self.cargo_hold.get('iron', 0) / self.CARGO_CAP, 1.0)
         active = self.state in ('loading', 'depositing')
         pulse  = (0.72 + 0.28 * math.sin(self.time * 8.0)) if active else 1.0
 
@@ -1124,9 +1130,10 @@ class CargoShip(Entity):
         pygame.draw.circle(surface, (0, 0, 0), (ix, iy), 4)
         pygame.draw.circle(surface, dot_col,   (ix, iy), 3)
 
-        # Purple hull aura when carrying special cargo
-        if self.special_cargo > 0.5:
-            s_fill  = min(self.special_cargo / self.SPECIAL_CAP, 1.0)
+        # Purple hull aura when carrying crystal
+        _crystal_held = self.cargo_hold.get('crystal', 0)
+        if _crystal_held > 0.5:
+            s_fill  = min(_crystal_held / self.CARGO_CAPS.get('crystal', 50), 1.0)
             sp      = (0.65 + 0.35 * math.sin(self.time * 7.0)) if active else 0.8
             r_aura  = max(5, int(math.hypot(L, W) * 1.15))
             for step in range(3, 0, -1):
@@ -1137,19 +1144,22 @@ class CargoShip(Entity):
                 pygame.draw.circle(surface, gc, (cx, cy), int(r_aura * frac))
 
         # ── Cargo bars above the ship ─────────────────────────────────────
-        if self.cargo > 0 or self.special_cargo > 0:
-            bar_w = max(20, int(L * 2.6))
-            bx    = cx - bar_w // 2
-            by    = int(cy - math.hypot(L, W) - 12)
-            if self.cargo > 0:
-                fill_w  = max(1, int(bar_w * fill))
-                bar_col = (min(255, int(80 + 175 * fill)),
-                           min(255, int(200 - 40  * fill)), 20)
-                pygame.draw.rect(surface, (25, 25, 25),   (bx, by, bar_w, 5))
-                pygame.draw.rect(surface, bar_col,         (bx, by, fill_w, 5))
-                pygame.draw.rect(surface, (140, 140, 140), (bx, by, bar_w, 5), 1)
-            if self.special_cargo > 0:
-                s_f    = min(self.special_cargo / self.SPECIAL_CAP, 1.0)
+        _total_held = sum(self.cargo_hold.values())
+        if _total_held > 0.1:
+            _total_cap = sum(self.CARGO_CAPS.values())
+            bar_w  = max(20, int(L * 2.6))
+            bx     = cx - bar_w // 2
+            by     = int(cy - math.hypot(L, W) - 12)
+            # Primary bar: total fill
+            tf     = min(_total_held / _total_cap, 1.0)
+            fill_w = max(1, int(bar_w * tf))
+            bc     = (min(255, int(80 + 175 * tf)), min(255, int(200 - 40 * tf)), 20)
+            pygame.draw.rect(surface, (25, 25, 25),   (bx, by, bar_w, 5))
+            pygame.draw.rect(surface, bc,              (bx, by, fill_w, 5))
+            pygame.draw.rect(surface, (140, 140, 140), (bx, by, bar_w, 5), 1)
+            # Secondary bar: crystal (purple) if present
+            if _crystal_held > 0.5:
+                s_f    = min(_crystal_held / self.CARGO_CAPS.get('crystal', 50), 1.0)
                 s_fill = max(1, int(bar_w * s_f))
                 sy_bar = by + 7
                 pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 5))

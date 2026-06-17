@@ -30,7 +30,7 @@ def run_match(commander0_factory, commander1_factory,
     Returns a dict of final stats plus the two commander instances (so a
     trainer can pull per-decision trajectories off them if they recorded any).
     """
-    ai_characters = setup_game()
+    ai_characters, _solar = setup_game()
     lasers: list = []
 
     spawn0 = _team_spawn_center(0)

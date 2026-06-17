@@ -46,7 +46,9 @@ class CommanderPolicy(nn.Module):
     GLOBAL_FEATS      = 8
     OWN_FLEET_FEATS   = 6
     ENEMY_FLEET_FEATS = 5
-    IN_DIM = GLOBAL_FEATS + MAX_FLEETS * OWN_FLEET_FEATS + MAX_FLEETS * ENEMY_FLEET_FEATS  # 52
+    ECONOMY_FEATS     = 6   # iron, copper, titanium, crystal, fuel (norm), miner count
+    IN_DIM = (GLOBAL_FEATS + MAX_FLEETS * OWN_FLEET_FEATS
+              + MAX_FLEETS * ENEMY_FLEET_FEATS + ECONOMY_FEATS)  # 58
 
     def __init__(self, hidden: int = 64):
         super().__init__()
@@ -77,7 +79,9 @@ class NeuralCommander:
     def __init__(self, team: int, enemy_team: int,
                  own_spawn: tuple[float, float], enemy_spawn: tuple[float, float],
                  world_w: float, world_h: float,
-                 policy: CommanderPolicy | None = None):
+                 policy: CommanderPolicy | None = None,
+                 team_materials: dict | None = None,
+                 miners_ref: list | None = None):
         self.team        = team
         self.enemy_team   = enemy_team
         self.own_spawn    = own_spawn
@@ -85,10 +89,12 @@ class NeuralCommander:
         self.world_w      = world_w
         self.world_h      = world_h
 
-        self.deployed     = False
-        self._elapsed     = 0.0
-        self._decision_t  = 0.0
-        self._rally: dict = {}   # id(fleet leader) -> (x, y)
+        self.deployed          = False
+        self._elapsed          = 0.0
+        self._decision_t       = 0.0
+        self._rally: dict      = {}   # id(fleet leader) -> (x, y)
+        self._team_materials   = team_materials   # shared ref: {team: {mat: float}}
+        self._miners_ref       = miners_ref or [] # shared ref: list of MinerShip
 
         # No usable trained weights (fresh checkout, model deleted, file
         # mid-write from a concurrent training run, architecture mismatch,
@@ -287,5 +293,21 @@ class NeuralCommander:
                 ])
             else:
                 feats.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+
+        # Economy features (6) — own team only; enemy economy is unobservable
+        if self._team_materials is not None:
+            mat        = self._team_materials.get(self.team, {})
+            own_miners = sum(1 for m in self._miners_ref
+                             if m.team == self.team and getattr(m, 'alive', True))
+            feats.extend([
+                min(1.0, mat.get('iron',     0) / 200.0),
+                min(1.0, mat.get('copper',   0) / 100.0),
+                min(1.0, mat.get('titanium', 0) / 100.0),
+                min(1.0, mat.get('crystal',  0) /  80.0),
+                min(1.0, mat.get('fuel',     0) / 100.0),
+                min(1.0, own_miners            /   5.0),
+            ])
+        else:
+            feats.extend([0.0] * CommanderPolicy.ECONOMY_FEATS)
 
         return feats
