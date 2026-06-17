@@ -1210,6 +1210,33 @@ def main():
                 ship.wy -= ship.height / 2
                 ship.deployed = False
                 ship.home_pos = (ship.wx + ship.width / 2, ship.wy + ship.height / 2)
+
+                if build_type == 'Carrier':
+                    ship.fleet_leader = ship
+                else:
+                    leader = next(
+                        (s for s in reversed(ai_characters + built_ships)
+                         if isinstance(s, Carrier) and s.team == team and s.alive),
+                        None,
+                    )
+                    if leader is not None:
+                        ship.fleet_leader = leader
+                        if build_type == 'Destroyer':
+                            n = sum(1 for s in ai_characters
+                                    if s.fleet_leader is leader and isinstance(s, Destroyer))
+                            ship.fleet_offset = (0.0, (1 if n % 2 == 0 else -1) * 550.0)
+                            ship.fleet_stray_dist = 900.0
+                        else:
+                            n = sum(1 for s in ai_characters
+                                    if s.fleet_leader is leader
+                                    and isinstance(s, AICharacter)
+                                    and not isinstance(s, (Carrier, Destroyer, Fighter)))
+                            angle = n * (math.tau / 6)
+                            radius = 280 + (n // 6) * 100
+                            ship.fleet_offset = (math.cos(angle) * radius,
+                                                 math.sin(angle) * radius)
+                            ship.fleet_stray_dist = 450.0
+
                 built_ships.append(ship)
         if built_ships:
             ai_characters.extend(built_ships)
