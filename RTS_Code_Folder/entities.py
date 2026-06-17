@@ -134,10 +134,11 @@ class Planet(Entity):
 
 
 class Constructor(Entity):
-    """Ship constructor stationed on the home planet."""
+    """Ship constructor stationed on the home planet. Also the win-condition target."""
 
     _COLORS     = [(180, 220, 255), (255, 180, 180)]
     _BUILD_TIME = 12.0   # seconds to complete one queued ship
+    MAX_HP      = 500
 
     def __init__(self, home_planet: Planet, team: int):
         self.home_planet = home_planet
@@ -156,6 +157,23 @@ class Constructor(Entity):
         self._col_dark   = tuple(max(0, c - 90) for c in color)
         self._col_mid    = tuple(max(0, c - 45) for c in color)
         self._col_bright = tuple(min(255, c + 60) for c in color)
+        self.max_hp = self.MAX_HP
+        self.hp     = self.max_hp
+        self.alive  = True
+
+    def take_damage(self, amount: float) -> None:
+        if not self.alive:
+            return
+        self.hp -= amount
+        if self.hp <= 0:
+            self.hp = 0
+            self.alive = False
+
+    def try_take_damage(self, amount: float) -> bool:
+        if random.random() < 0.95:
+            self.take_damage(amount)
+            return True
+        return False
 
     def queue_build(self, ship_type: str) -> None:
         """Add a ship type to the build queue."""
@@ -168,6 +186,8 @@ class Constructor(Entity):
         return max(0.0, min(1.0, 1.0 - self.build_timer / self._BUILD_TIME))
 
     def update(self, dt: float):
+        if not self.alive:
+            return None
         planet_cx = self.home_planet.wx + self.home_planet.radius
         planet_cy = self.home_planet.wy + self.home_planet.radius
         self.wx = planet_cx - self.radius
@@ -188,13 +208,11 @@ class Constructor(Entity):
         return None
 
     def draw(self, surface: pygame.Surface, camera) -> None:
-        if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
+        if not self.alive or not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
             return
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         zoom     = camera.zoom
-        R        = max(6, int(self.radius * 1.8 * zoom))   # visual outer radius
-        hub      = max(3, int(R * 0.28))                   # central hub radius
-        mid_ring = int(R * 0.62)                           # rotating machinery band
+        R        = max(6, int(self.radius * 1.8 * zoom))
         progress = self._build_progress()
         building = bool(self.build_queue)
 
@@ -202,118 +220,137 @@ class Constructor(Entity):
         dark   = self._col_dark
         mid    = self._col_mid
         bright = self._col_bright
+        lw     = max(1, int(zoom * 1.5))
 
-        ring_rot  = self.time * 0.10          # slow outer-ring rotation
-        inner_rot = self.time * 1.6 * (1.0 + progress * 0.8)  # assembly arms
+        def r(f): return int(f * R)
 
-        N  = 8
-        lw = max(1, int(zoom * 1.1))
+        # ── Outer hexagonal perimeter ──────────────────────────────────────────
+        hex_r    = r(1.25)
+        hex_pts  = [(cx + int(math.cos(k * math.tau / 6) * hex_r),
+                     cy + int(math.sin(k * math.tau / 6) * hex_r))
+                    for k in range(6)]
+        pygame.draw.polygon(surface, dark, hex_pts)
+        pygame.draw.polygon(surface, mid,  hex_pts, max(2, lw))
 
-        # ── Production glow ───────────────────────────────────────────────────
+        # Inner chamfer ring
+        hex2_r   = hex_r - max(2, r(0.06))
+        hex2_pts = [(cx + int(math.cos(k * math.tau / 6) * hex2_r),
+                     cy + int(math.sin(k * math.tau / 6) * hex2_r))
+                    for k in range(6)]
+        pygame.draw.polygon(surface, bright, hex2_pts, lw)
+
+        # ── Six processing nodes at hex vertices ───────────────────────────────
+        node_d = r(0.75)
+        nodes  = [(cx + int(math.cos(k * math.tau / 6) * node_d),
+                   cy + int(math.sin(k * math.tau / 6) * node_d))
+                  for k in range(6)]
+        nr = max(3, r(0.12))
+
+        # Spoke conduits center → each node
+        for nx, ny in nodes:
+            pygame.draw.line(surface, mid, (cx, cy), (nx, ny), lw)
+
+        # Energy ring connecting adjacent nodes (pulses when active)
+        pulse = 0.45 + 0.55 * abs(math.sin(self.time * 2.5)) if building else 0.40
+        ec    = tuple(min(255, int(c * pulse)) for c in bright)
+        for i in range(6):
+            pygame.draw.line(surface, ec, nodes[i], nodes[(i + 1) % 6], max(1, lw))
+
+        # Node bodies
+        for i, (nx, ny) in enumerate(nodes):
+            pygame.draw.circle(surface, dark, (nx, ny), nr)
+            pygame.draw.circle(surface, col if i % 2 == 0 else mid, (nx, ny), nr, lw)
+            if building:
+                cp = 0.4 + 0.6 * abs(math.sin(self.time * 3.0 + i * math.pi / 3))
+                nc = tuple(min(255, int(c * cp)) for c in bright)
+                pygame.draw.circle(surface, nc, (nx, ny), max(1, nr // 2))
+            else:
+                pygame.draw.circle(surface, mid, (nx, ny), max(1, nr // 2))
+
+        # ── Assembly platforms between alternating node pairs ──────────────────
+        for i in range(3):
+            a_bay         = (2 * i + 1) * math.tau / 6
+            bx            = cx + int(math.cos(a_bay) * r(0.90))
+            by            = cy + int(math.sin(a_bay) * r(0.90))
+            hd            = max(1, r(0.07))   # radial half-depth
+            hw2           = max(2, r(0.13))   # tangential half-width
+            cos_b, sin_b  = math.cos(a_bay), math.sin(a_bay)
+            corners       = [
+                (bx + int(cos_b * dd - sin_b * tt),
+                 by + int(sin_b * dd + cos_b * tt))
+                for dd, tt in [(-hd, -hw2), (hd, -hw2), (hd, hw2), (-hd, hw2)]
+            ]
+            pygame.draw.polygon(surface, tuple(max(0, c - 30) for c in dark), corners)
+            pygame.draw.polygon(surface, mid, corners, lw)
+
+        # ── Central reactor ─────────────────────────────────────────────────────
+        reactor_r = r(0.36)
+        pygame.draw.circle(surface, dark, (cx, cy), reactor_r)
+        pygame.draw.circle(surface, col,  (cx, cy), reactor_r, max(2, int(lw * 1.5)))
+
+        # Three rotating partial-arc rings inside the reactor
+        for ring_i in range(3):
+            rr     = max(2, int(reactor_r * (0.76 - ring_i * 0.24)))
+            spd    = (0.5 + ring_i * 0.5) * (1.8 if building else 0.5)
+            a_rot  = self.time * spd
+            frac   = 0.68
+            n_pts  = max(6, int(18 * frac))
+            seg_c  = tuple(min(255, int(c * (0.45 + 0.30 * ring_i))) for c in bright)
+            prev_p = None
+            for k in range(n_pts + 1):
+                a  = a_rot + k * math.tau * frac / n_pts
+                pt = (cx + int(math.cos(a) * rr), cy + int(math.sin(a) * rr))
+                if prev_p and rr >= 2:
+                    pygame.draw.line(surface, seg_c, prev_p, pt, lw)
+                prev_p = pt
+
+        # Reactor core
+        core_r = max(2, r(0.09))
         if building:
-            gp = 0.3 + 0.2 * math.sin(self.time * 4.0) + 0.25 * progress
-            for step in range(3, 0, -1):
-                frac = step / 3.0
-                gc   = tuple(min(255, int(c * frac * gp * 0.55)) for c in bright)
-                pygame.draw.circle(surface, gc, (cx, cy),
-                                   R + int(10 * frac * zoom))
-
-        # ── Sector plates (body of the building) ──────────────────────────────
-        for i in range(N):
-            a1 = i       * math.tau / N
-            a2 = (i + 1) * math.tau / N
-            plate_col = dark if i % 2 == 0 else tuple(max(0, c - 25) for c in mid)
-            pts = [(cx, cy)]
-            for s in range(7):
-                a = a1 + (a2 - a1) * s / 6.0
-                pts.append((int(cx + math.cos(a) * (R - max(1, int(2 * zoom)))),
-                            int(cy + math.sin(a) * (R - max(1, int(2 * zoom))))))
-            pygame.draw.polygon(surface, plate_col, pts)
-
-        # ── Radial structural spokes ──────────────────────────────────────────
-        for i in range(N):
-            a = i * math.tau / N
-            pygame.draw.line(surface, mid,
-                             (int(cx + math.cos(a) * hub),
-                              int(cy + math.sin(a) * hub)),
-                             (int(cx + math.cos(a) * R),
-                              int(cy + math.sin(a) * R)), lw)
-
-        # ── Rotating mid-ring (gear/conveyor band) ────────────────────────────
-        pygame.draw.circle(surface, mid, (cx, cy), mid_ring,
-                           max(2, int(2.5 * zoom)))
-        tick_len = max(2, int(4 * zoom))
-        for i in range(16):
-            a  = ring_rot + i * math.tau / 16
-            r1 = mid_ring - tick_len
-            r2 = mid_ring + tick_len
-            pygame.draw.line(surface, bright,
-                             (int(cx + math.cos(a) * r1), int(cy + math.sin(a) * r1)),
-                             (int(cx + math.cos(a) * r2), int(cy + math.sin(a) * r2)),
-                             max(1, int(zoom)))
-
-        # ── Outer structural ring ─────────────────────────────────────────────
-        pygame.draw.circle(surface, col, (cx, cy), R, max(2, int(3 * zoom)))
-        pygame.draw.circle(surface, bright, (cx, cy), R + 1, max(1, int(zoom)))
-
-        # ── Perimeter station modules (at sector midpoints) ───────────────────
-        mod_r = max(2, int(3.5 * zoom))
-        for i in range(N):
-            a  = (i + 0.5) * math.tau / N
-            mx = int(cx + math.cos(a) * R)
-            my = int(cy + math.sin(a) * R)
-            pp = 0.5 + 0.5 * math.sin(self.time * 3.5 + i * 0.78)
-            mc = tuple(min(255, int(c * pp)) for c in bright) \
-                 if (building and i % 2 == 0) else mid
-            pygame.draw.circle(surface, dark, (mx, my), mod_r + 1)
-            pygame.draw.circle(surface, mc,   (mx, my), mod_r)
-
-        # ── Central hub ───────────────────────────────────────────────────────
-        pygame.draw.circle(surface, dark, (cx, cy), hub)
-        pygame.draw.circle(surface, mid,  (cx, cy), hub, max(1, int(1.5 * zoom)))
-
-        # ── Assembly arms (production animation — always rotate when building) ─
-        arm_r = max(1, hub - max(1, int(3 * zoom)))
-        alw   = max(1, int(2 * zoom))
-        cos_i = math.cos(inner_rot)
-        sin_i = math.sin(inner_rot)
-        pygame.draw.line(surface, bright,
-                         (cx, cy),
-                         (int(cx + cos_i * arm_r), int(cy + sin_i * arm_r)), alw)
-        pygame.draw.line(surface, mid,
-                         (cx, cy),
-                         (int(cx - cos_i * arm_r), int(cy - sin_i * arm_r)),
-                         max(1, alw - 1))
-        c2 = math.cos(inner_rot + math.pi / 2)
-        s2 = math.sin(inner_rot + math.pi / 2)
-        cr = int(arm_r * 0.55)
-        pygame.draw.line(surface, mid,
-                         (int(cx + c2 * cr), int(cy + s2 * cr)),
-                         (int(cx - c2 * cr), int(cy - s2 * cr)),
-                         max(1, int(zoom)))
-
-        # Core dot
-        core_r = max(2, int(3 * zoom))
-        if building:
-            cp       = 0.55 + 0.45 * math.sin(self.time * 7.0)
-            core_col = tuple(min(255, int(c * cp)) for c in bright)
+            cp2    = 0.6 + 0.4 * math.sin(self.time * 6.0)
+            core_c = tuple(min(255, int(c * cp2)) for c in bright)
         else:
-            core_col = mid
-        pygame.draw.circle(surface, core_col, (cx, cy), core_r)
+            core_c = mid
+        pygame.draw.circle(surface, core_c, (cx, cy), core_r)
 
-        # ── Build progress arc (sweeps clockwise from 12 o'clock) ────────────
+        # ── Construction activity ──────────────────────────────────────────────
+        if building:
+            a0 = self.time * 2.0
+            for k in range(4):
+                ka = a0 + k * math.tau / 4
+                kx = cx + int(math.cos(ka) * r(0.54))
+                ky = cy + int(math.sin(ka) * r(0.54))
+                kc = tuple(min(255, int(c * abs(math.sin(a0 + k * 0.8)))) for c in bright)
+                pygame.draw.circle(surface, kc, (kx, ky), max(2, r(0.05)))
+
+        # ── Damage warning ─────────────────────────────────────────────────────
+        if self.hp < self.max_hp * 0.5 and math.sin(self.time * 6.0) > 0:
+            pygame.draw.circle(surface, (255, 60, 60),
+                               (cx + r(0.28), cy - r(0.28)), max(2, r(0.07)))
+
+        # ── Health bar ─────────────────────────────────────────────────────────
+        bar_w  = r(2.5)
+        bar_h  = max(2, int(3 * zoom))
+        bar_x  = cx - bar_w // 2
+        bar_y  = cy - hex_r - bar_h - max(2, r(0.06))
+        pygame.draw.rect(surface, (120, 0, 0),    (bar_x, bar_y, bar_w, bar_h))
+        fill_w = int(bar_w * self.hp / self.max_hp)
+        pygame.draw.rect(surface, (0, 210, 60),   (bar_x, bar_y, fill_w, bar_h))
+        pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
+
+        # ── Build progress arc ─────────────────────────────────────────────────
         if progress > 0.0:
-            arc_r   = R + max(3, int(5 * zoom))
+            arc_r   = hex_r + max(3, r(0.06))
             arc_lw  = max(2, int(3 * zoom))
             a_start = -math.pi / 2
             a_end   = a_start + math.tau * progress
             arc_col = (int(80 + 175 * progress), int(220 - 60 * progress), 40)
             n_seg   = max(4, int(36 * progress))
             prev_pt = None
-            for s in range(n_seg + 1):
-                a  = a_start + (a_end - a_start) * s / n_seg
-                pt = (int(cx + math.cos(a) * arc_r),
-                      int(cy + math.sin(a) * arc_r))
+            for seg in range(n_seg + 1):
+                a   = a_start + (a_end - a_start) * seg / n_seg
+                pt  = (int(cx + math.cos(a) * arc_r),
+                       int(cy + math.sin(a) * arc_r))
                 if prev_pt:
                     pygame.draw.line(surface, arc_col, prev_pt, pt, arc_lw)
                 prev_pt = pt

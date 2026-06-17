@@ -652,29 +652,17 @@ def _build_asteroid_field(world_surf: pygame.Surface,
 def setup_game():  # both sides start with resources only, no pre-built ships
     solar_entities = []
     constructors = {}
-    home_planets = {}
     for team in (0, 1):
         solar_team = _build_solar_system(team)
         solar_entities.extend(solar_team)
         constructor = next((e for e in solar_team if isinstance(e, Constructor)), None)
         if constructor:
             constructors[team] = constructor
-        home_planet = next((e for e in solar_team if isinstance(e, Planet) and e.planet_type == 'home'), None)
-        if home_planet:
-            home_planets[team] = home_planet
 
-    # Create command centers orbiting home planets
+    # Mount command centers on top of each team's Constructor
     for team in (0, 1):
-        if team in home_planets:
-            home_planet = home_planets[team]
-            command_center = CommandCenter(
-                home_planet=home_planet,
-                orbit_radius=home_planet.radius + 350,
-                angle=math.pi if team == 1 else 0,
-                team=team,
-                orbit_speed=0.3
-            )
-            solar_entities.append(command_center)
+        if team in constructors:
+            solar_entities.append(CommandCenter(constructor=constructors[team], team=team))
 
     ai_characters = []
 
@@ -2123,7 +2111,7 @@ def main():
         update_team_strategy(ai_characters)
 
         alive_before = {id(s): s.alive for s in ai_characters}
-        _combat_targets = (ai_characters + [m for m in miners if m.alive] + 
+        _combat_targets = (ai_characters + [m for m in miners if m.alive] +
                           [c for c in cargo_ships if c.alive] +
                           [cc for cc in command_centers_by_team.values() if cc.alive])
         for ship in ai_characters:
@@ -2363,24 +2351,19 @@ def main():
         if not game_over:
             enemy_team = 1 - player_team
             player_cc = command_centers_by_team.get(player_team)
-            enemy_cc = command_centers_by_team.get(enemy_team)
-            
-            # Track if either command center just died this frame
+            enemy_cc  = command_centers_by_team.get(enemy_team)
+
             if player_cc and not player_cc.alive:
-                # Player's command center destroyed → DEFEAT
                 game_over = True
                 victory = False
-                # Create explosion at command center
                 explosions.append(Explosion(
                     player_cc.wx + player_cc.radius,
                     player_cc.wy + player_cc.radius,
                     player_cc.width, player_cc.height,
                 ))
             elif enemy_cc and not enemy_cc.alive:
-                # Enemy's command center destroyed → VICTORY
                 game_over = True
                 victory = True
-                # Create explosion at command center
                 explosions.append(Explosion(
                     enemy_cc.wx + enemy_cc.radius,
                     enemy_cc.wy + enemy_cc.radius,
