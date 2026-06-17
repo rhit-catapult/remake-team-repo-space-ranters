@@ -37,6 +37,7 @@ from camera import Camera
 from entities import (AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer,
                       Star, Planet, Constructor, DysonSphere, DysonNode,
                       GlowingAsteroid, MineableAsteroid, MinerShip, CargoShip)
+from command_center import CommandCenter
 from commander import AICommander
 from neural_commander import NeuralCommander
 
@@ -646,12 +647,29 @@ def _build_asteroid_field(world_surf: pygame.Surface,
 def setup_game():
     solar_entities = []
     constructors = {}
+    home_planets = {}
     for team in (0, 1):
         solar_team = _build_solar_system(team)
         solar_entities.extend(solar_team)
         constructor = next((e for e in solar_team if isinstance(e, Constructor)), None)
         if constructor:
             constructors[team] = constructor
+        home_planet = next((e for e in solar_team if isinstance(e, Planet) and e.planet_type == 'home'), None)
+        if home_planet:
+            home_planets[team] = home_planet
+
+    # Create command centers orbiting home planets
+    for team in (0, 1):
+        if team in home_planets:
+            home_planet = home_planets[team]
+            command_center = CommandCenter(
+                home_planet=home_planet,
+                orbit_radius=home_planet.radius + 350,
+                angle=math.pi if team == 1 else 0,  # opposite sides
+                team=team,
+                orbit_speed=0.3
+            )
+            solar_entities.append(command_center)
 
     # Spawn initial fleets from constructors
     ai_characters = []
@@ -1077,6 +1095,40 @@ def _draw_quit_confirm(screen, elapsed, mouse_pos):
     return resume_rect
 
 
+def _draw_game_end(screen, victory: bool, player_team: int, elapsed: float):
+    """Display game end screen (victory or defeat overlay)."""
+    sw, sh = screen.get_size()
+    overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 200))
+    screen.blit(overlay, (0, 0))
+
+    font_title = pygame.font.SysFont("impact", 72)
+    font_sub   = pygame.font.SysFont("monospace", 18)
+    font_hint  = pygame.font.SysFont("monospace", 14)
+
+    if victory:
+        title_text = "VICTORY!"
+        title_col = TEAM_COLORS[player_team]
+        sub_text = "Enemy command center destroyed!"
+    else:
+        title_text = "DEFEAT"
+        title_col = (220, 80, 80)
+        sub_text = "Your command center was destroyed."
+
+    # Pulsing title
+    pulse = 0.6 + 0.4 * math.sin(elapsed * 3.0)
+    title_col = tuple(min(255, int(c * pulse)) for c in title_col)
+    
+    title = font_title.render(title_text, True, title_col)
+    screen.blit(title, title.get_rect(center=(sw // 2, sh // 2 - 80)))
+
+    sub = font_sub.render(sub_text, True, (200, 200, 200))
+    screen.blit(sub, sub.get_rect(center=(sw // 2, sh // 2 + 20)))
+
+    hint = font_hint.render("Close window or press Esc to exit", True, (140, 140, 160))
+    screen.blit(hint, hint.get_rect(center=(sw // 2, sh // 2 + 120)))
+
+
 # ── Resource / build helpers ──────────────────────────────────────────────────
 
 def _ai_assign_miners(team, miners, asteroids, planets_by_team):
@@ -1369,6 +1421,7 @@ def main():
     }
     miners:         list       = []
     constructors_by_team       = {e.team: e for e in solar_entities if isinstance(e, Constructor)}
+    command_centers_by_team    = {e.team: e for e in solar_entities if isinstance(e, CommandCenter)}
     planets_by_team: dict      = {}
     for _e in solar_entities:
         if isinstance(_e, Planet):
@@ -1456,6 +1509,10 @@ def main():
     # HUD visibility (status panel, minimap, banner, control hints, and the
     # planet orbit guide-lines) — toggled with Tab for a clean battle view.
     hud_visible = True
+    
+    # Game end state — triggered when a command center is destroyed
+    game_over = False
+    victory = False  # True if player won, False if player lost
 
     def render_frame():
         screen_w, screen_h = screen.get_size()
@@ -1541,6 +1598,18 @@ def main():
             continue
 
         # ── Events ────────────────────────────────────────────────────────────
+        # If game is over, only allow quit/escape
+        if game_over:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+            render_frame()
+            _draw_game_end(screen, victory, player_team, elapsed)
+            pygame.display.flip()
+            continue
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 quit_confirm = True
@@ -1996,7 +2065,9 @@ def main():
         update_team_strategy(ai_characters)
 
         alive_before = {id(s): s.alive for s in ai_characters}
-        _combat_targets = ai_characters + [m for m in miners if m.alive] + [c for c in cargo_ships if c.alive]
+        _combat_targets = (ai_characters + [m for m in miners if m.alive] + 
+                          [c for c in cargo_ships if c.alive] +
+                          [cc for cc in command_centers_by_team.values() if cc.alive])
         for ship in ai_characters:
             ship.update_combat(dt, _combat_targets, lasers)
 
@@ -2207,6 +2278,35 @@ def main():
                 cmd_markers.clear()
 
         camera.clamp(WORLD_W, WORLD_H)
+
+        # ── Win/Lose Condition Check ─────────────────────────────────────────
+        # Game ends when one side's command center is destroyed
+        if not game_over:
+            enemy_team = 1 - player_team
+            player_cc = command_centers_by_team.get(player_team)
+            enemy_cc = command_centers_by_team.get(enemy_team)
+            
+            # Track if either command center just died this frame
+            if player_cc and not player_cc.alive:
+                # Player's command center destroyed → DEFEAT
+                game_over = True
+                victory = False
+                # Create explosion at command center
+                explosions.append(Explosion(
+                    player_cc.wx + player_cc.radius,
+                    player_cc.wy + player_cc.radius,
+                    player_cc.width, player_cc.height,
+                ))
+            elif enemy_cc and not enemy_cc.alive:
+                # Enemy's command center destroyed → VICTORY
+                game_over = True
+                victory = True
+                # Create explosion at command center
+                explosions.append(Explosion(
+                    enemy_cc.wx + enemy_cc.radius,
+                    enemy_cc.wy + enemy_cc.radius,
+                    enemy_cc.width, enemy_cc.height,
+                ))
 
         # ── Draw ──────────────────────────────────────────────────────────────
         render_frame()
