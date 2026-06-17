@@ -559,11 +559,22 @@ class MinerShip(Entity):
         self.vx = self.vy   = 0.0
         self.angle          = 0.0
         self.time           = 0.0
+        self._land_offset   = 0.0   # surface angle offset relative to planet.angle at landing
+        self._drill_spin    = 0.0   # animated drill rotation counter
+        self.max_hp         = 60
+        self.hp             = 60
+        self.drill_hp       = 100.0
+        self.drill_max_hp   = 100.0
+        self._needs_defense = False  # set True by active escort orders; cleared each frame
+        self._asteroid_mode = False  # True while assigned to an asteroid; auto-reassigns on depletion
+        self.asteroids      = []     # shared list reference; set from main.py after construction
 
     def send_to(self, planet) -> None:
-        """Order this miner to fly to and land on planet."""
-        self._target = planet
-        self.state   = 'to_planet'
+        """Order this miner to fly to and land on planet/asteroid."""
+        self._target        = planet
+        self.state          = 'to_planet'
+        ptype               = getattr(planet, 'planet_type', None)
+        self._asteroid_mode = ptype in ('asteroid', 'glowing')
 
     def update(self, dt: float) -> None:
         if not self.alive:
@@ -575,14 +586,45 @@ class MinerShip(Entity):
 
         if self.state == 'landed':
             if self._landed_planet is not None:
-                # Follow the orbiting target (planets orbit; asteroids are static — fine either way)
-                self.wx = self._landed_planet.wx + self._landed_planet.radius - self.width  / 2
-                self.wy = self._landed_planet.wy + self._landed_planet.radius - self.height / 2
-                ptype = getattr(self._landed_planet, 'planet_type', None)
-                if ptype == 'glowing':
-                    self.special_cargo += self._SPECIAL_MINE_RATE * dt
-                else:
-                    self.cargo += self._MINE_RATES.get(ptype, 3.0) * dt
+                pcx          = self._landed_planet.wx + self._landed_planet.radius
+                pcy          = self._landed_planet.wy + self._landed_planet.radius
+                planet_angle = getattr(self._landed_planet, 'angle', 0.0)
+                abs_angle    = planet_angle + self._land_offset
+                pr           = self._landed_planet.radius
+                self.wx    = pcx + math.cos(abs_angle) * pr - self.width  / 2
+                self.wy    = pcy + math.sin(abs_angle) * pr - self.height / 2
+                self.angle = abs_angle + math.pi   # nose faces inward toward planet
+                if self.drill_hp > 0:
+                    self._drill_spin += 4.5 * dt
+                    ptype = getattr(self._landed_planet, 'planet_type', None)
+                    rate  = (self._SPECIAL_MINE_RATE if ptype == 'glowing'
+                             else self._MINE_RATES.get(ptype, 3.0))
+                    mined = rate * dt
+                    # For finite-resource bodies (asteroids) cap and deduct
+                    if hasattr(self._landed_planet, 'resources'):
+                        mined = min(mined, self._landed_planet.resources)
+                        self._landed_planet.resources -= mined
+                        if self._landed_planet.resources <= 0:
+                            self._landed_planet.alive = False
+                            depleted                  = self._landed_planet
+                            self._landed_planet       = None
+                            # Auto-reassign to another asteroid if in asteroid mode
+                            if self._asteroid_mode and self.asteroids:
+                                next_a = next(
+                                    (a for a in self.asteroids
+                                     if a is not depleted and a.alive
+                                     and getattr(a, 'resources', 1) > 0),
+                                    None,
+                                )
+                                if next_a is not None:
+                                    self.send_to(next_a)
+                                    return
+                            self.state = 'idle'
+                            return
+                    if ptype == 'glowing':
+                        self.special_cargo += mined
+                    else:
+                        self.cargo += mined
             return
 
         if self.state == 'to_planet':
@@ -596,6 +638,10 @@ class MinerShip(Entity):
                           ty - (self.wy + self.height / 2)) < self.DOCK_RANGE:
                 self.state          = 'landed'
                 self._landed_planet = self._target
+                mcx = self.wx + self.width  / 2
+                mcy = self.wy + self.height / 2
+                abs_surface       = math.atan2(mcy - ty, mcx - tx)
+                self._land_offset = abs_surface - getattr(self._target, 'angle', 0.0)
 
     def _move_toward(self, tx: float, ty: float, dt: float) -> None:
         cx   = self.wx + self.width  / 2
@@ -612,6 +658,24 @@ class MinerShip(Entity):
             self.vx = self.vy = 0.0
         self.wx += self.vx * dt
         self.wy += self.vy * dt
+
+    @property
+    def hit_chance(self) -> float:
+        return 0.60
+
+    def take_damage(self, amount: int) -> None:
+        self.hp -= amount
+        if self.state == 'landed':
+            self.drill_hp = max(0.0, self.drill_hp - amount * 1.5)
+        if self.hp <= 0:
+            self.hp    = 0
+            self.alive = False
+
+    def try_take_damage(self, amount: int) -> bool:
+        if random.random() < self.hit_chance:
+            self.take_damage(amount)
+            return True
+        return False
 
     def draw(self, surface: pygame.Surface, camera) -> None:
         if not self.alive or not camera.is_visible(self.world_rect):
@@ -642,6 +706,60 @@ class MinerShip(Entity):
         rim = (200, 255, 200) if self.state == 'landed' else (255, 255, 255)
         pygame.draw.polygon(surface, rim, pts, 1)
 
+        # ── Animated drill when landed ────────────────────────────────────
+        if self.state == 'landed':
+            drill_frac = self.drill_hp / self.drill_max_hp
+            broken     = self.drill_hp <= 0
+            shaft_ext  = L * 1.1
+            shaft_s    = ts(L, 0)
+            shaft_e    = ts(L + shaft_ext, 0)
+            shaft_col  = (160, 40, 30) if broken else (int(140 * drill_frac + 60 * (1 - drill_frac)),
+                                                        int(135 * drill_frac + 30 * (1 - drill_frac)),
+                                                        int(115 * drill_frac + 20 * (1 - drill_frac)))
+            pygame.draw.line(surface, shaft_col, shaft_s, shaft_e,
+                             max(2, int(3 * camera.zoom)))
+            if not broken:
+                # Helical stripes scrolling along the shaft
+                for i in range(5):
+                    t = ((i / 5) + self._drill_spin * 0.07) % 1.0
+                    sx_ = int(shaft_s[0] + (shaft_e[0] - shaft_s[0]) * t)
+                    sy_ = int(shaft_s[1] + (shaft_e[1] - shaft_s[1]) * t)
+                    pygame.draw.circle(surface, (210, 200, 155), (sx_, sy_),
+                                       max(1, int(2 * camera.zoom)))
+                # Spinning drill bit at tip
+                drill_r  = max(3, int(W * 0.55))
+                tip_x, tip_y = shaft_e
+                for k in range(4):
+                    ba  = self._drill_spin + k * (math.pi / 4)
+                    bx  = int(tip_x + (-sin_a * math.cos(ba) + cos_a * math.sin(ba)) * drill_r)
+                    by_ = int(tip_y + ( cos_a * math.cos(ba) + sin_a * math.sin(ba)) * drill_r)
+                    b_col = (235, 220, 160) if k % 2 == 0 else (170, 160, 120)
+                    pygame.draw.line(surface, b_col, (tip_x, tip_y), (bx, by_),
+                                     max(1, int(2 * camera.zoom)))
+                spark_r = max(2, int(W * 0.32 * (0.65 + 0.35 * math.sin(self.time * 16.0))))
+                pygame.draw.circle(surface, (255, 210, 80),  shaft_e, spark_r + 1)
+                pygame.draw.circle(surface, (255, 255, 200), shaft_e, max(1, spark_r - 1))
+            else:
+                # Broken drill: red X at tip
+                tip_x, tip_y = shaft_e
+                arm = max(3, int(W * 0.45))
+                pygame.draw.line(surface, (200, 50, 40),
+                                 (tip_x - arm, tip_y - arm), (tip_x + arm, tip_y + arm),
+                                 max(1, int(2 * camera.zoom)))
+                pygame.draw.line(surface, (200, 50, 40),
+                                 (tip_x + arm, tip_y - arm), (tip_x - arm, tip_y + arm),
+                                 max(1, int(2 * camera.zoom)))
+            # Drill health bar (shown only when damaged)
+            if drill_frac < 1.0:
+                dbar_w = max(12, int(L * 1.8))
+                dbx    = int(shaft_s[0] + (shaft_e[0] - shaft_s[0]) * 0.5) - dbar_w // 2
+                dby    = int(shaft_s[1] + (shaft_e[1] - shaft_s[1]) * 0.5) - max(8, int(6 * camera.zoom))
+                dfill  = max(1, int(dbar_w * drill_frac))
+                dc     = (int(220 * (1 - drill_frac)), int(200 * drill_frac), 20)
+                pygame.draw.rect(surface, (30, 15, 10),  (dbx, dby, dbar_w, 3))
+                pygame.draw.rect(surface, dc,             (dbx, dby, dfill,  3))
+                pygame.draw.rect(surface, (160, 80, 60),  (dbx, dby, dbar_w, 3), 1)
+
         # State dot — grey=idle, green=flying, amber=landed & mining
         dot_col = {'idle': (120, 120, 120), 'to_planet': (80, 210, 80),
                    'landed': (255, 200, 40)}.get(self.state, (128, 128, 128))
@@ -666,6 +784,18 @@ class MinerShip(Entity):
                 pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 4))
                 pygame.draw.rect(surface, (180,  80, 255),  (bx, sy_bar, s_fill, 4))
                 pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 4), 1)
+
+        # Hull health bar (shown when damaged)
+        if self.hp < self.max_hp:
+            bar_w  = max(16, int(L * 2.4))
+            bx     = cx - bar_w // 2
+            by     = int(cy - math.hypot(L, W) - 20)
+            hp_f   = self.hp / self.max_hp
+            fill_w = max(1, int(bar_w * hp_f))
+            hp_col = (int(255 * (1 - hp_f)), int(200 * hp_f), 30)
+            pygame.draw.rect(surface, (35, 10, 10),  (bx, by, bar_w, 4))
+            pygame.draw.rect(surface, hp_col,         (bx, by, fill_w, 4))
+            pygame.draw.rect(surface, (180, 60, 60),  (bx, by, bar_w, 4), 1)
 
 
 class CargoShip(Entity):
@@ -704,6 +834,10 @@ class CargoShip(Entity):
         self.time                 = 0.0
         self._beam_active         = False
         self._unload_beam_active  = False
+        self.max_hp               = 80
+        self.hp                   = 80
+        self._needs_defense       = False
+        self._assigned_miners     = None  # None = auto-seek any miner; list = restricted pool
 
     def update(self, dt: float) -> None:
         if not self.alive:
@@ -713,9 +847,15 @@ class CargoShip(Entity):
         self._unload_beam_active = False
 
         if self.state == 'seeking':
+            # Prune dead miners from the assigned list; fall back to auto if all gone
+            if self._assigned_miners is not None:
+                self._assigned_miners = [m for m in self._assigned_miners if m.alive]
+                if not self._assigned_miners:
+                    self._assigned_miners = None
+            pool = self._assigned_miners if self._assigned_miners is not None else self._miners_ref
             best       = None
             best_cargo = 8.0
-            for m in self._miners_ref:
+            for m in pool:
                 if (m.team == self.team and m.alive
                         and m.state == 'landed' and m.cargo > best_cargo):
                     best_cargo = m.cargo
@@ -726,6 +866,12 @@ class CargoShip(Entity):
 
         elif self.state == 'to_miner':
             if self._target_miner is None or not self._target_miner.alive:
+                self.state = 'seeking'
+                return
+            # Reassignment happened while en-route — go back and pick the right miner
+            if (self._assigned_miners is not None
+                    and self._target_miner not in self._assigned_miners):
+                self._target_miner = None
                 self.state = 'seeking'
                 return
             tx = self._target_miner.wx + self._target_miner.width  / 2
@@ -925,6 +1071,35 @@ class CargoShip(Entity):
                   else (180, 180, 180)
         pygame.draw.polygon(surface, rim_col, hull_pts, 1)
 
+        # ── Cargo crates attached to hull sides ───────────────────────────
+        if fill > 0.01:
+            crate_lxs = [-L * 0.64, -L * 0.34, -L * 0.04, L * 0.19]
+            cw = L * 0.13   # half-width along ship axis
+            ch = W * 0.20   # half-height perpendicular
+            for i, clx in enumerate(crate_lxs):
+                if fill < (i + 1) / 4:
+                    continue
+                cp = pulse if active else 1.0
+                crate_col = (
+                    min(255, int((100 + 100 * fill) * cp)),
+                    min(255, int((70  +  70 * fill) * cp)),
+                    int(15  *  (1 - fill)),
+                )
+                rim_c = (min(255, crate_col[0] + 45),
+                         min(255, crate_col[1] + 35),
+                         min(255, crate_col[2] + 8))
+                border_w = max(1, int(camera.zoom * 0.8))
+                for sign in (-1, 1):
+                    cly = W * 1.02 * sign
+                    pts = [
+                        ts(clx - cw, cly - ch),
+                        ts(clx + cw, cly - ch),
+                        ts(clx + cw, cly + ch),
+                        ts(clx - cw, cly + ch),
+                    ]
+                    pygame.draw.polygon(surface, crate_col, pts)
+                    pygame.draw.polygon(surface, rim_c, pts, border_w)
+
         # Engine glow at stern
         eng_px = int(cx - cos_a * L)
         eng_py = int(cy - sin_a * L)
@@ -981,6 +1156,34 @@ class CargoShip(Entity):
                 pygame.draw.rect(surface, (180,  80, 255), (bx, sy_bar, s_fill, 5))
                 pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 5), 1)
 
+        # Hull health bar (shown when damaged)
+        if self.hp < self.max_hp:
+            bar_w  = max(20, int(L * 2.6))
+            bx     = cx - bar_w // 2
+            by     = int(cy - math.hypot(L, W) - 24)
+            hp_f   = self.hp / self.max_hp
+            fill_w = max(1, int(bar_w * hp_f))
+            hp_col = (int(255 * (1 - hp_f)), int(200 * hp_f), 30)
+            pygame.draw.rect(surface, (35, 10, 10),  (bx, by, bar_w, 5))
+            pygame.draw.rect(surface, hp_col,         (bx, by, fill_w, 5))
+            pygame.draw.rect(surface, (180, 60, 60),  (bx, by, bar_w, 5), 1)
+
+    @property
+    def hit_chance(self) -> float:
+        return 0.65
+
+    def take_damage(self, amount: int) -> None:
+        self.hp -= amount
+        if self.hp <= 0:
+            self.hp    = 0
+            self.alive = False
+
+    def try_take_damage(self, amount: int) -> bool:
+        if random.random() < self.hit_chance:
+            self.take_damage(amount)
+            return True
+        return False
+
 
 class GlowingAsteroid:
     """
@@ -1007,6 +1210,9 @@ class GlowingAsteroid:
         self.height = self.radius * 2
         self.angle  = random.uniform(0.0, math.tau)
         self.time   = random.uniform(0.0, 12.0)   # phase offset so each rock pulses differently
+        self.alive         = True
+        self.resources     = float(self.radius * 8)   # 440–960 special units
+        self.max_resources = self.resources
 
         n = random.randint(7, 11)
         self._shape = []
@@ -1023,16 +1229,19 @@ class GlowingAsteroid:
         self.time += dt
 
     def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive:
+            return
         pad = self.radius
         if not camera.is_visible_xywh(self.wx - pad, self.wy - pad, pad * 2, pad * 2):
             return
 
         sx, sy = camera.world_to_screen(self.wx, self.wy)
         zoom   = camera.zoom
-        pulse  = 0.5 + 0.5 * math.sin(self.time * 1.6)
+        res_frac = max(0.0, self.resources / self.max_resources)
+        pulse  = (0.5 + 0.5 * math.sin(self.time * 1.6)) * res_frac
         r_scr  = max(2, int(self.radius * zoom))
 
-        # Outer glow rings
+        # Outer glow rings (fade as resource depletes)
         for step in range(5, 0, -1):
             glow_r = r_scr + int(step * 9 * zoom)
             frac   = (step / 5) * pulse * 0.45
@@ -1044,7 +1253,13 @@ class GlowingAsteroid:
             if glow_r > 1:
                 pygame.draw.circle(surface, gc, (sx, sy), glow_r)
 
-        # Rock body
+        # Rock body (greyer when nearly depleted)
+        grey_blend = 1.0 - res_frac * 0.5
+        rock_col = (
+            int(self._rock_color[0] * grey_blend + 80 * (1 - grey_blend)),
+            int(self._rock_color[1] * grey_blend + 80 * (1 - grey_blend)),
+            int(self._rock_color[2] * grey_blend + 80 * (1 - grey_blend)),
+        )
         cos_a = math.cos(self.angle)
         sin_a = math.sin(self.angle)
         pts   = [
@@ -1053,13 +1268,24 @@ class GlowingAsteroid:
             for lx, ly in self._shape
         ]
         if len(pts) >= 3:
-            pygame.draw.polygon(surface, self._rock_color, pts)
-            pygame.draw.polygon(surface, self._rock_rim,   pts, max(1, int(zoom)))
+            pygame.draw.polygon(surface, rock_col,       pts)
+            pygame.draw.polygon(surface, self._rock_rim, pts, max(1, int(zoom)))
 
-        # Bright core
+        # Bright core (dims as resource depletes)
         core_r = max(2, int(r_scr * 0.28))
-        core_c = tuple(min(255, int(c * (0.6 + 0.4 * pulse))) for c in self.glow_color)
+        core_c = tuple(min(255, int(c * (0.6 + 0.4 * pulse) * res_frac)) for c in self.glow_color)
         pygame.draw.circle(surface, core_c, (sx, sy), core_r)
+
+        # Resource bar below the rock
+        if res_frac < 1.0:
+            bar_w  = max(10, int(r_scr * 2.0))
+            bar_h  = max(2, int(3 * zoom))
+            bar_x  = sx - bar_w // 2
+            bar_y  = sy + r_scr + max(3, int(4 * zoom))
+            fill_w = max(0, int(bar_w * res_frac))
+            pygame.draw.rect(surface, (60, 0, 80),  (bar_x, bar_y, bar_w,  bar_h))
+            pygame.draw.rect(surface, tuple(min(255, c) for c in self.glow_color),
+                             (bar_x, bar_y, fill_w, bar_h))
 
 
 class MineableAsteroid:
@@ -1078,8 +1304,10 @@ class MineableAsteroid:
         self.radius = random.randint(70, 140)
         self.width  = self.radius * 2
         self.height = self.radius * 2
-        self.alive  = True
-        self.time   = 0.0
+        self.alive         = True
+        self.time          = 0.0
+        self.resources     = float(self.radius * 10)   # 700–1400 ore units
+        self.max_resources = self.resources
 
         n = random.randint(7, 11)
         self._shape = []
@@ -1095,25 +1323,48 @@ class MineableAsteroid:
         pass
 
     def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive:
+            return
         pad = self.radius
         if not camera.is_visible_xywh(self.wx - pad, self.wy - pad, pad * 2, pad * 2):
             return
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         z      = camera.zoom
-        pts    = [
+        res_frac = max(0.0, self.resources / self.max_resources)
+
+        # Rock fill dims as ore runs out
+        fill_col = (
+            int(self._col_fill[0] * res_frac + 60 * (1 - res_frac)),
+            int(self._col_fill[1] * res_frac + 60 * (1 - res_frac)),
+            int(self._col_fill[2] * res_frac + 55 * (1 - res_frac)),
+        )
+        pts = [
             (int(cx + lx * z), int(cy + ly * z))
             for lx, ly in self._shape
         ]
         if len(pts) >= 3:
-            pygame.draw.polygon(surface, self._col_fill, pts)
-            pygame.draw.polygon(surface, self._col_rim,  pts, max(1, int(2 * z)))
-        # Subtle outer ring so the player can distinguish it from the painted background
+            pygame.draw.polygon(surface, fill_col,     pts)
+            pygame.draw.polygon(surface, self._col_rim, pts, max(1, int(2 * z)))
+        # Outer ring
         r_out = max(4, int(self.radius * z * 1.12))
         pygame.draw.circle(surface, (170, 165, 160), (cx, cy), r_out, max(1, int(z)))
-        # Pickaxe-like cross to signal "mineable"
-        arm = max(4, int(self.radius * z * 0.25))
-        pygame.draw.line(surface, (220, 210, 200), (cx - arm, cy), (cx + arm, cy), max(1, int(z)))
-        pygame.draw.line(surface, (220, 210, 200), (cx, cy - arm), (cx, cy + arm), max(1, int(z)))
+        # Pickaxe cross (hidden once fully depleted)
+        if res_frac > 0.05:
+            arm = max(4, int(self.radius * z * 0.25))
+            cross_col = (int(220 * res_frac + 80 * (1 - res_frac)),
+                         int(210 * res_frac + 80 * (1 - res_frac)),
+                         int(200 * res_frac + 80 * (1 - res_frac)))
+            pygame.draw.line(surface, cross_col, (cx - arm, cy), (cx + arm, cy), max(1, int(z)))
+            pygame.draw.line(surface, cross_col, (cx, cy - arm), (cx, cy + arm), max(1, int(z)))
+        # Resource bar
+        r_scr  = max(4, int(self.radius * z))
+        bar_w  = max(10, int(r_scr * 2.0))
+        bar_h  = max(2, int(3 * z))
+        bar_x  = cx - bar_w // 2
+        bar_y  = cy + r_out + max(3, int(4 * z))
+        fill_px = max(0, int(bar_w * res_frac))
+        pygame.draw.rect(surface, (50, 35, 20),   (bar_x, bar_y, bar_w,  bar_h))
+        pygame.draw.rect(surface, (200, 160, 60), (bar_x, bar_y, fill_px, bar_h))
 
 
 # Team colour palettes: index 0 = team 0 (blue), index 1 = team 1 (red)
@@ -1579,9 +1830,9 @@ class AICharacter(Entity):
         # ships can spread fire across multiple targets instead of pile-driving one.
         target_counts: dict[int, int] = {}
         for ship in all_ships:
-            if ship.team == self.team and ship.alive and ship._current_target is not None:
-                tid = id(ship._current_target)
-                target_counts[tid] = target_counts.get(tid, 0) + 1
+            _tgt = getattr(ship, '_current_target', None)
+            if ship.team == self.team and ship.alive and _tgt is not None:
+                target_counts[id(_tgt)] = target_counts.get(id(_tgt), 0) + 1
 
         focus_fleet = self.team_focus_fleet.get(self.team)
 
@@ -1607,7 +1858,7 @@ class AICharacter(Entity):
                 lcy = self.fleet_leader.wy + self.fleet_leader.height / 2
                 score -= max(0.0, (1000.0 - math.hypot(ex - lcx, ey - lcy)) * 0.8)
             # Fleet commander: mass fire on whichever enemy fleet is weakest
-            if focus_fleet is not None and ship.fleet_leader is focus_fleet:
+            if focus_fleet is not None and getattr(ship, 'fleet_leader', None) is focus_fleet:
                 score -= 300.0
             if score < best_score:
                 best_score  = score

@@ -549,8 +549,11 @@ def _build_solar_system(team):
 _ASTEROID_TOTAL   = 320   # total rocks in the diagonal field
 _ASTEROID_GLOW_NTH =  25   # every Nth rock is a live glowing entity; rest baked into bg
 
-
 _ASTEROID_MINEABLE_N = 12   # number of large interactable asteroid entities
+
+# Respawn: when alive counts fall below these, new asteroids are spawned
+_RESPAWN_MIN_ORE   = 4   # minimum live MineableAsteroids before new ones appear
+_RESPAWN_MIN_GLOW  = 2   # minimum live GlowingAsteroids before new ones appear
 
 
 def _build_asteroid_field(world_surf: pygame.Surface,
@@ -1109,6 +1112,7 @@ def main():
                     _con.wx + _con.radius, _con.wy + _con.radius,
                     _team, planets_by_team.get(_team, []),
                 ))
+                miners[-1].asteroids = asteroids
             cargo_ships.append(CargoShip(
                 _con.wx + _con.radius, _con.wy + _con.radius,
                 _team, _con, miners, team_resources, team_special_resources,
@@ -1437,47 +1441,175 @@ def main():
                                 (_clicked_target.wx + _clicked_target.radius,
                                  _clicked_target.wy + _clicked_target.radius))
 
+                    # ── Detect click on friendly cargo ship ───────────────────
+                    _clicked_cargo = None
+                    if target_enemy is None:
+                        for _c in cargo_ships:
+                            if _c.team == player_team and _c.alive:
+                                _ccx, _ccy = camera.world_to_screen(
+                                    _c.wx + _c.width / 2, _c.wy + _c.height / 2)
+                                if math.hypot(cx_s - _ccx, cy_s - _ccy) < max(14, int(
+                                        math.hypot(_c.width, _c.height) / 2 * camera.zoom)):
+                                    _clicked_cargo = _c
+                                    break
+
+                    # ── Detect click on friendly miner ship ────────────────────
+                    _clicked_miner = None
+                    if target_enemy is None and _clicked_cargo is None:
+                        for _mn in miners:
+                            if _mn.team == player_team and _mn.alive:
+                                _mcx, _mcy = camera.world_to_screen(
+                                    _mn.wx + _mn.width / 2, _mn.wy + _mn.height / 2)
+                                if math.hypot(cx_s - _mcx, cy_s - _mcy) < max(14, int(
+                                        math.hypot(_mn.width, _mn.height) / 2 * camera.zoom + 8)):
+                                    _clicked_miner = _mn
+                                    break
+
+                    # ── Cargo ship → specific miner assignment ────────────────
+                    _sel_cargos = [s for s in selected_ships
+                                   if isinstance(s, CargoShip) and s.team == player_team]
+                    if _sel_cargos:
+                        if _clicked_miner is not None and _clicked_miner.team == player_team:
+                            # Shift = add to pool; no shift = replace pool
+                            for _cs in _sel_cargos:
+                                if queueing:
+                                    if _cs._assigned_miners is None:
+                                        _cs._assigned_miners = [_clicked_miner]
+                                    elif _clicked_miner not in _cs._assigned_miners:
+                                        _cs._assigned_miners.append(_clicked_miner)
+                                else:
+                                    _cs._assigned_miners = [_clicked_miner]
+                            cmd_markers.append((
+                                _clicked_miner.wx + _clicked_miner.width  / 2,
+                                _clicked_miner.wy + _clicked_miner.height / 2,
+                            ))
+                        elif (_clicked_target is None and target_enemy is None
+                              and _clicked_cargo is None and _clicked_miner is None):
+                            # Right-click empty space = clear back to automatic routing
+                            for _cs in _sel_cargos:
+                                _cs._assigned_miners = None
+
                     # ── Combat orders — miners excluded ────────────────────────
                     _combat_sel = [s for s in selected_ships
-                                   if not isinstance(s, MinerShip)]
+                                   if not isinstance(s, MinerShip)
+                                   and not isinstance(s, CargoShip)]
                     if _combat_sel:
                         cxs   = [s.wx + s.width  / 2 for s in _combat_sel]
                         cys   = [s.wy + s.height / 2 for s in _combat_sel]
                         cen_x = sum(cxs) / len(cxs)
                         cen_y = sum(cys) / len(cys)
 
-                        for s, scx, scy in zip(_combat_sel, cxs, cys):
-                            s.deployed = True
+                        if (_clicked_planet is not None
+                                and getattr(_clicked_planet, 'team', None) == player_team
+                                and target_enemy is None):
+                            # ── Guard planet ───────────────────────────────────
+                            for s in _combat_sel:
+                                s.deployed = True
+                                # Release any active escort assignment
+                                _oq = player_orders.get(id(s), [])
+                                if _oq and _oq[0].get('type') == 'escort':
+                                    if s.fleet_leader is _oq[0].get('target'):
+                                        s.fleet_leader = None
+                                order = {'ship_ref': s, 'type': 'guard_planet',
+                                         'planet': _clicked_planet}
+                                if queueing:
+                                    player_orders.setdefault(id(s), []).append(order)
+                                else:
+                                    player_orders[id(s)] = [order]
+                            cmd_markers.append((_clicked_planet.wx + _clicked_planet.radius,
+                                                _clicked_planet.wy + _clicked_planet.radius))
+
+                        elif _clicked_cargo is not None and target_enemy is None:
+                            # ── Escort cargo ship ──────────────────────────────
+                            cargo_cx = _clicked_cargo.wx + _clicked_cargo.width  / 2
+                            cargo_cy = _clicked_cargo.wy + _clicked_cargo.height / 2
+                            for s, scx, scy in zip(_combat_sel, cxs, cys):
+                                s.deployed = True
+                                raw_ox = scx - cargo_cx
+                                raw_oy = scy - cargo_cy
+                                d = math.hypot(raw_ox, raw_oy)
+                                if d < 50:
+                                    raw_ox, raw_oy = 280.0, 0.0
+                                elif d > 600:
+                                    scale = 450.0 / d
+                                    raw_ox, raw_oy = raw_ox * scale, raw_oy * scale
+                                order = {
+                                    'ship_ref': s, 'type': 'escort',
+                                    'target': _clicked_cargo,
+                                    'offset': (raw_ox, raw_oy),
+                                }
+                                if queueing:
+                                    player_orders.setdefault(id(s), []).append(order)
+                                else:
+                                    player_orders[id(s)] = [order]
+                            cmd_markers.append((cargo_cx, cargo_cy))
+
+                        elif _clicked_miner is not None and target_enemy is None:
+                            # ── Escort miner ship ──────────────────────────────
+                            miner_cx = _clicked_miner.wx + _clicked_miner.width  / 2
+                            miner_cy = _clicked_miner.wy + _clicked_miner.height / 2
+                            for s, scx, scy in zip(_combat_sel, cxs, cys):
+                                s.deployed = True
+                                raw_ox = scx - miner_cx
+                                raw_oy = scy - miner_cy
+                                d = math.hypot(raw_ox, raw_oy)
+                                if d < 50:
+                                    raw_ox, raw_oy = 260.0, 0.0
+                                elif d > 600:
+                                    scale = 420.0 / d
+                                    raw_ox, raw_oy = raw_ox * scale, raw_oy * scale
+                                order = {
+                                    'ship_ref': s, 'type': 'escort',
+                                    'target': _clicked_miner,
+                                    'offset': (raw_ox, raw_oy),
+                                }
+                                if queueing:
+                                    player_orders.setdefault(id(s), []).append(order)
+                                else:
+                                    player_orders[id(s)] = [order]
+                            cmd_markers.append((miner_cx, miner_cy))
+
+                        else:
+                            # ── Normal combat orders ───────────────────────────
+                            for s, scx, scy in zip(_combat_sel, cxs, cys):
+                                s.deployed = True
+                                # Release any active escort assignment
+                                _oq = player_orders.get(id(s), [])
+                                if _oq and _oq[0].get('type') == 'escort':
+                                    if s.fleet_leader is _oq[0].get('target'):
+                                        s.fleet_leader = None
+                                if target_enemy is not None:
+                                    order = {'ship_ref': s, 'type': 'attack',
+                                             'target': target_enemy}
+                                elif target_ally is not None:
+                                    order = {
+                                        'ship_ref': s, 'type': 'follow',
+                                        'target': target_ally,
+                                        'offset': (scx - (target_ally.wx + target_ally.width / 2),
+                                                   scy - (target_ally.wy + target_ally.height / 2)),
+                                    }
+                                else:
+                                    dest = (wx + (scx - cen_x), wy + (scy - cen_y))
+                                    order = {
+                                        'ship_ref': s,
+                                        'type':     'attack_move' if attack_move_mod else 'move',
+                                        'pos':      dest,
+                                    }
+                                    cmd_markers.append(dest)
+
+                                if queueing:
+                                    player_orders.setdefault(id(s), []).append(order)
+                                else:
+                                    player_orders[id(s)] = [order]
+
                             if target_enemy is not None:
-                                order = {'ship_ref': s, 'type': 'attack', 'target': target_enemy}
+                                tx = target_enemy.wx + target_enemy.width  / 2
+                                ty = target_enemy.wy + target_enemy.height / 2
+                                cmd_markers.append((tx, ty))
                             elif target_ally is not None:
-                                order = {
-                                    'ship_ref': s, 'type': 'follow', 'target': target_ally,
-                                    'offset': (scx - (target_ally.wx + target_ally.width / 2),
-                                               scy - (target_ally.wy + target_ally.height / 2)),
-                                }
-                            else:
-                                dest = (wx + (scx - cen_x), wy + (scy - cen_y))
-                                order = {
-                                    'ship_ref': s,
-                                    'type':     'attack_move' if attack_move_mod else 'move',
-                                    'pos':      dest,
-                                }
-                                cmd_markers.append(dest)
-
-                            if queueing:
-                                player_orders.setdefault(id(s), []).append(order)
-                            else:
-                                player_orders[id(s)] = [order]
-
-                        if target_enemy is not None:
-                            tx = target_enemy.wx + target_enemy.width  / 2
-                            ty = target_enemy.wy + target_enemy.height / 2
-                            cmd_markers.append((tx, ty))
-                        elif target_ally is not None:
-                            tx = target_ally.wx + target_ally.width  / 2
-                            ty = target_ally.wy + target_ally.height / 2
-                            cmd_markers.append((tx, ty))
+                                tx = target_ally.wx + target_ally.width  / 2
+                                ty = target_ally.wy + target_ally.height / 2
+                                cmd_markers.append((tx, ty))
 
                     cmd_marker_t = 2.5   # show markers for 2.5 seconds
 
@@ -1503,6 +1635,7 @@ def main():
                     miners.append(MinerShip(
                         sx, sy, team, planets_by_team.get(team, []),
                     ))
+                    miners[-1].asteroids = asteroids
                     continue
 
                 if build_type == 'CargoShip':
@@ -1565,12 +1698,19 @@ def main():
         update_team_strategy(ai_characters)
 
         alive_before = {id(s): s.alive for s in ai_characters}
+        _combat_targets = ai_characters + [m for m in miners if m.alive] + [c for c in cargo_ships if c.alive]
         for ship in ai_characters:
-            ship.update_combat(dt, ai_characters, lasers)
+            ship.update_combat(dt, _combat_targets, lasers)
 
         # Enemy commander — decides when its fleet deploys and where it
         # rallies, then steers idle ("patrol") fleet leaders toward that order.
         commander.update(dt, ai_characters)
+
+        # Reset per-frame escort flags (re-set by active escort orders below).
+        for _c in cargo_ships:
+            _c._needs_defense = False
+        for _m in miners:
+            _m._needs_defense = False
 
         # Apply player orders — override combat AI's movement destination.
         # Each ship has a queue; the head order is "current" and advances
@@ -1625,6 +1765,35 @@ def main():
                     ox, oy = order['offset']
                     ref._movement_override = (tgt.wx + tgt.width  / 2 + ox,
                                                tgt.wy + tgt.height / 2 + oy)
+
+            elif order['type'] == 'guard_planet':
+                planet = order['planet']
+                if hasattr(planet, 'alive') and not planet.alive:
+                    finished = True
+                else:
+                    order['_orbit_angle'] = order.get('_orbit_angle', 0.0) + 0.28 * dt
+                    if ref._current_target is None or not getattr(ref._current_target, 'alive', False):
+                        # Orbit the planet when not in combat
+                        pcx = planet.wx + planet.radius
+                        pcy = planet.wy + planet.radius
+                        guard_r = planet.radius + 400.0
+                        ref._movement_override = (
+                            pcx + math.cos(order['_orbit_angle']) * guard_r,
+                            pcy + math.sin(order['_orbit_angle']) * guard_r,
+                        )
+                    # else: combat AI is handling movement — don't override it
+
+            elif order['type'] == 'escort':
+                tgt = order['target']
+                if not tgt.alive:
+                    if ref.fleet_leader is tgt:
+                        ref.fleet_leader = None
+                    finished = True
+                else:
+                    # Bind fleet_leader so combat AI's fleet-cohesion follows the cargo ship
+                    ref.fleet_leader  = tgt
+                    ref.fleet_offset  = order['offset']
+                    tgt._needs_defense = True
 
             if finished:
                 queue.pop(0)
@@ -1692,6 +1861,36 @@ def main():
         # Asteroid field tick
         for asteroid in asteroids:
             asteroid.update(dt)
+
+        # Prune exhausted asteroids then respawn if counts fall below minimums
+        asteroids[:] = [a for a in asteroids if getattr(a, 'alive', True)]
+        _ore_count  = sum(1 for a in asteroids if isinstance(a, MineableAsteroid))
+        _glow_count = sum(1 for a in asteroids if isinstance(a, GlowingAsteroid))
+        if _ore_count < _RESPAWN_MIN_ORE or _glow_count < _RESPAWN_MIN_GLOW:
+            _diag = math.sqrt(WORLD_W ** 2 + WORLD_H ** 2)
+            _px   = WORLD_H / _diag
+            _py   = WORLD_W / _diag
+            for _ in range(_RESPAWN_MIN_ORE - _ore_count):
+                t   = random.uniform(0.08, 0.92)
+                off = random.uniform(-480, 480)
+                mx  = max(100.0, min(WORLD_W - 100, WORLD_W * (1 - t) + off * _px))
+                my  = max(100.0, min(WORLD_H - 100, WORLD_H * t       + off * _py))
+                asteroids.append(MineableAsteroid(mx, my))
+            for _ in range(_RESPAWN_MIN_GLOW - _glow_count):
+                t   = random.uniform(0.08, 0.92)
+                off = random.uniform(-480, 480)
+                gx  = max(100.0, min(WORLD_W - 100, WORLD_W * (1 - t) + off * _px))
+                gy  = max(100.0, min(WORLD_H - 100, WORLD_H * t       + off * _py))
+                asteroids.append(GlowingAsteroid(gx, gy))
+
+        # Re-assign player miners that went idle because their asteroid depleted.
+        # Once a miner is in asteroid_mode it should keep mining like a planet miner would.
+        _avail_asteroids = [a for a in asteroids if getattr(a, 'resources', 1) > 0]
+        if _avail_asteroids:
+            for _m in miners:
+                if (_m.team == player_team and _m.alive
+                        and _m.state == 'idle' and _m._asteroid_mode):
+                    _m.send_to(random.choice(_avail_asteroids))
 
         # Laser and explosion ticks
         for laser in lasers:
