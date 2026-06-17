@@ -35,7 +35,8 @@ import threading
 import pygame
 from camera import Camera
 from entities import (AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer,
-                      Star, Planet, Constructor, DysonSphere, DysonNode)
+                      Star, Planet, Constructor, DysonSphere, DysonNode,
+                      GlowingAsteroid, MineableAsteroid, MinerShip, CargoShip)
 from commander import AICommander
 from neural_commander import NeuralCommander
 
@@ -66,6 +67,25 @@ TEAM_COLORS = [
 ]
 TEAM_NAMES = ["BLUE COMMAND", "RED COMMAND"]
 
+# ── Resource / build system ───────────────────────────────────────────────────
+STARTING_RESOURCES = 200
+
+SHIP_COSTS = {
+    'MinerShip':   25,
+    'CargoShip':   40,
+    'AICharacter': 50,
+    'Destroyer':   130,
+    'Carrier':     300,
+}
+
+_BUILD_MENU_ROWS = [
+    ('MinerShip',   'Miner',     SHIP_COSTS['MinerShip']),
+    ('CargoShip',   'Cargo',     SHIP_COSTS['CargoShip']),
+    ('AICharacter', 'Frigate',   SHIP_COSTS['AICharacter']),
+    ('Destroyer',   'Destroyer', SHIP_COSTS['Destroyer']),
+    ('Carrier',     'Carrier',   SHIP_COSTS['Carrier']),
+]
+
 # ── Cached fonts (initialised on first use after pygame.font.init) ────────────
 _FONT_SM     = None
 _FONT_MED    = None
@@ -89,7 +109,7 @@ def _ensure_hud_surfaces():
     if _HUD_PANEL is not None:
         return
     font_sm, _, _ = _fonts()
-    _HUD_PANEL = pygame.Surface((290, 14 + 9 * 18), pygame.SRCALPHA)
+    _HUD_PANEL = pygame.Surface((290, 14 + 11 * 18), pygame.SRCALPHA)
     _HUD_MM    = pygame.Surface((180, 120), pygame.SRCALPHA)
     hints = [
         "LMB: Select   Shift+LMB: Add/Remove",
@@ -188,6 +208,7 @@ def run_loading_screen(screen, clock, player_team):
         'step':          'Initialising…',
         'world_surf':    None,
         'ai_characters': None,
+        'asteroids':     [],
         'done':          False,
     }
 
@@ -196,8 +217,13 @@ def run_loading_screen(screen, clock, player_team):
         state['progress'] = 0.03
         state['world_surf'] = build_world_surface(state)   # updates progress 0.05→0.55
 
+        state['step']     = 'Placing asteroid field…'
+        state['progress'] = 0.58
+        state['asteroids'] = _build_asteroid_field(
+            state['world_surf'], WORLD_W, WORLD_H)
+
         state['step']     = 'Deploying fleets…'
-        state['progress'] = 0.60
+        state['progress'] = 0.62
         result = setup_game()
         if isinstance(result, tuple):
             state['ai_characters'], state['solar_entities'] = result
@@ -243,7 +269,7 @@ def run_loading_screen(screen, clock, player_team):
         pygame.display.flip()
 
     t.join()
-    return state['world_surf'], state['ai_characters'], state['solar_entities']
+    return state['world_surf'], state['ai_characters'], state['solar_entities'], state['asteroids']
 
 
 # ── Menu ──────────────────────────────────────────────────────────────────────
@@ -520,6 +546,66 @@ def _build_solar_system(team):
     return [star, dyson_sphere] + dyson_nodes + planets + [constructor]
 
 
+_ASTEROID_TOTAL   = 320   # total rocks in the diagonal field
+_ASTEROID_GLOW_NTH =  25   # every Nth rock is a live glowing entity; rest baked into bg
+
+
+_ASTEROID_MINEABLE_N = 12   # number of large interactable asteroid entities
+
+
+def _build_asteroid_field(world_surf: pygame.Surface,
+                          world_w: float, world_h: float) -> list:
+    """
+    Scatter _ASTEROID_TOTAL rocks along the top-right→bottom-left diagonal band.
+    Non-glowing rocks are painted directly onto world_surf as static background art.
+    Returns a list containing GlowingAsteroid and MineableAsteroid entities.
+    """
+    glowing = []
+    diag     = math.sqrt(world_w ** 2 + world_h ** 2)
+    # Unit vector perpendicular to the diagonal axis (rotated 90°)
+    perp_x   =  world_h / diag
+    perp_y   =  world_w / diag
+    band_half = 600.0   # narrow corridor so asteroids form a line, not a cloud
+
+    for i in range(_ASTEROID_TOTAL):
+        t  = random.uniform(0.0, 1.0)   # evenly spread along the full diagonal
+        bx = world_w * (1.0 - t)
+        by = world_h * t
+        off = random.uniform(-band_half, band_half)
+        wx  = max(0.0, min(world_w, bx + off * perp_x))
+        wy  = max(0.0, min(world_h, by + off * perp_y))
+
+        if i % _ASTEROID_GLOW_NTH == 0:
+            glowing.append(GlowingAsteroid(wx, wy))
+        else:
+            # Paint a static rock polygon directly onto the world surface
+            radius = random.randint(22, 75)
+            n      = random.randint(6, 10)
+            a0     = random.uniform(0.0, math.tau)
+            pts    = [
+                (int(wx + math.cos(a0 + j * math.tau / n + random.uniform(-0.3, 0.3))
+                     * radius * random.uniform(0.55, 1.0)),
+                 int(wy + math.sin(a0 + j * math.tau / n + random.uniform(-0.3, 0.3))
+                     * radius * random.uniform(0.55, 1.0)))
+                for j in range(n)
+            ]
+            pygame.draw.polygon(world_surf, (168, 162, 155), pts)
+            pygame.draw.polygon(world_surf, (210, 205, 200), pts, 1)
+
+    # Scatter large interactable MineableAsteroid entities along the same band
+    mineable = []
+    for _ in range(_ASTEROID_MINEABLE_N):
+        t   = random.uniform(0.05, 0.95)
+        bx  = world_w * (1.0 - t)
+        by  = world_h * t
+        off = random.uniform(-band_half * 0.8, band_half * 0.8)
+        mx  = max(0.0, min(world_w, bx + off * perp_x))
+        my  = max(0.0, min(world_h, by + off * perp_y))
+        mineable.append(MineableAsteroid(mx, my))
+
+    return glowing + mineable
+
+
 def setup_game():
     solar_entities = []
     constructors = {}
@@ -701,7 +787,8 @@ _hud_detail_bg    = None   # reusable bg strip for ship detail
 
 
 def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
-             fps, screen_w, screen_h, player_orders):
+             fps, screen_w, screen_h, player_orders,
+             team_resources=None, team_special_resources=None):
     global _hud_banner_surf, _hud_banner_bg, _hud_minimap_lbl, _hud_detail_bg
 
     _ensure_hud_surfaces()
@@ -728,8 +815,12 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
     panel_h = panel.get_height()
     panel.fill((0, 0, 0, 155))
     pygame.draw.rect(panel, (*team_col, 200), (0, 0, 4, panel_h))
+    res_val  = int(team_resources.get(player_team, 0))          if team_resources          else 0
+    spec_val = int(team_special_resources.get(player_team, 0)) if team_special_resources else 0
     lines = [
         (f"FPS: {fps:.0f}",                                              (160, 160, 180)),
+        (f"RESOURCES: {res_val}",                                        (100, 230, 120)),
+        (f"SPECIAL:   {spec_val}",                                       (190, 100, 255)),
         ("",                                                              (160, 160, 180)),
         (f"YOUR FLEET:  {f_count:3d} ships  ({f_carr} carriers)",        team_col),
         (f"ENEMY FLEET: {e_count:3d} ships  ({e_carr} carriers)",        TEAM_COLORS[enemy_team]),
@@ -750,9 +841,9 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
             t = type(s).__name__
             types[t] = types.get(t, 0) + 1
         type_str = "  ".join(f"{v}× {k}" for k, v in types.items())
-        if all(s.player_hold for s in selected_ships):
+        if selected_ships and all(getattr(s, 'player_hold', False) for s in selected_ships):
             type_str += "   [HOLDING]"
-        if all(s.hold_fire for s in selected_ships):
+        if selected_ships and all(getattr(s, 'hold_fire', False) for s in selected_ships):
             type_str += "   [HOLD FIRE]"
         detail  = font_med.render(type_str, True, (220, 220, 100))
         dw      = detail.get_width()
@@ -865,6 +956,122 @@ def _draw_quit_confirm(screen, elapsed, mouse_pos):
     return resume_rect
 
 
+# ── Resource / build helpers ──────────────────────────────────────────────────
+
+def _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships, team_resources):
+    """Queue a ship for the AI team when it has enough resources."""
+    constructor = constructors_by_team.get(enemy_team)
+    if constructor is None or len(constructor.build_queue) >= 3:
+        return
+    res        = team_resources.get(enemy_team, 0.0)
+    own_miners = sum(1 for m in miners if m.team == enemy_team and m.alive)
+    own_cargo  = sum(1 for c in cargo_ships if c.team == enemy_team and c.alive)
+    if own_miners < 3 and res >= SHIP_COSTS['MinerShip']:
+        constructor.queue_build('MinerShip')
+        team_resources[enemy_team] -= SHIP_COSTS['MinerShip']
+    elif own_cargo < max(1, own_miners) and res >= SHIP_COSTS['CargoShip']:
+        constructor.queue_build('CargoShip')
+        team_resources[enemy_team] -= SHIP_COSTS['CargoShip']
+    elif res >= SHIP_COSTS['Carrier']:
+        constructor.queue_build('Carrier')
+        team_resources[enemy_team] -= SHIP_COSTS['Carrier']
+    elif res >= SHIP_COSTS['Destroyer']:
+        constructor.queue_build('Destroyer')
+        team_resources[enemy_team] -= SHIP_COSTS['Destroyer']
+    elif res >= SHIP_COSTS['AICharacter']:
+        constructor.queue_build('AICharacter')
+        team_resources[enemy_team] -= SHIP_COSTS['AICharacter']
+
+
+def get_asteroid_at(asteroids, camera, sx, sy):
+    """Return a mineable asteroid (GlowingAsteroid or MineableAsteroid) under (sx,sy)."""
+    for a in asteroids:
+        if not hasattr(a, 'planet_type'):
+            continue
+        ax, ay = camera.world_to_screen(a.wx + a.radius, a.wy + a.radius)
+        if math.hypot(sx - ax, sy - ay) < max(12, int(a.radius * camera.zoom)):
+            return a
+    return None
+
+
+def get_planet_at(solar_entities, camera, sx, sy):
+    """Return the Planet under screen point (sx, sy), or None."""
+    for e in solar_entities:
+        if not isinstance(e, Planet):
+            continue
+        ex, ey = camera.world_to_screen(e.wx + e.radius, e.wy + e.radius)
+        if math.hypot(sx - ex, sy - ey) < max(15, int(e.radius * camera.zoom)):
+            return e
+    return None
+
+
+def _get_constructor_at_screen(solar_entities, camera, sx, sy):
+    """Return the Constructor under screen point (sx, sy), or None."""
+    for e in solar_entities:
+        if not isinstance(e, Constructor):
+            continue
+        ex, ey = camera.world_to_screen(e.wx + e.radius, e.wy + e.radius)
+        if math.hypot(sx - ex, sy - ey) < max(20, int(e.radius * camera.zoom)):
+            return e
+    return None
+
+
+def draw_build_menu(screen, constructor, team_resources, player_team):
+    """Draw the build queue menu.  Returns list of (ship_type, pygame.Rect)."""
+    sw, sh   = screen.get_size()
+    res      = int(team_resources.get(player_team, 0))
+    team_col = TEAM_COLORS[player_team]
+
+    font_title = pygame.font.SysFont("impact",    20)
+    font_row   = pygame.font.SysFont("monospace", 14)
+
+    row_h   = 40
+    panel_w = 300
+    panel_h = 34 + len(_BUILD_MENU_ROWS) * row_h + 28
+    px = sw - panel_w - 14
+    py = sh // 2 - panel_h // 2
+
+    bg = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    bg.fill((6, 10, 22, 225))
+    pygame.draw.rect(bg, (*team_col, 220), (0, 0, panel_w, panel_h), 2, border_radius=8)
+    screen.blit(bg, (px, py))
+
+    # Header
+    hdr  = font_title.render("CONSTRUCTOR", True, team_col)
+    screen.blit(hdr, (px + 10, py + 7))
+    res_s = font_row.render(f"Resources: {res}", True, (100, 230, 120))
+    screen.blit(res_s, (px + panel_w - res_s.get_width() - 10, py + 10))
+
+    # Build rows
+    option_rects = []
+    y = py + 34
+    for ship_type, label, cost in _BUILD_MENU_ROWS:
+        can = res >= cost
+        rect = pygame.Rect(px + 6, y, panel_w - 12, row_h - 4)
+        pygame.draw.rect(screen, (28, 48, 80) if can else (28, 18, 18), rect, border_radius=5)
+        pygame.draw.rect(screen, (70, 140, 220) if can else (55, 35, 35), rect, 1, border_radius=5)
+        lbl  = font_row.render(label, True, (215, 215, 215) if can else (90, 70, 70))
+        cost_s = font_row.render(str(cost), True, (90, 220, 100) if can else (150, 70, 70))
+        screen.blit(lbl,    (rect.x + 8,  rect.centery - lbl.get_height()  // 2))
+        screen.blit(cost_s, (rect.right - cost_s.get_width() - 8,
+                             rect.centery - cost_s.get_height() // 2))
+        option_rects.append((ship_type, rect))
+        y += row_h
+
+    # Queue display
+    if constructor.build_queue:
+        q_names = {'AICharacter': 'Frigate', 'MinerShip': 'Miner',
+                   'Destroyer': 'Destroyer', 'Carrier': 'Carrier'}
+        q_str = " → ".join(q_names.get(t, t) for t in constructor.build_queue[:5])
+        qs = font_row.render(f"Queue: {q_str}", True, (160, 160, 200))
+        screen.blit(qs, (px + 10, y + 4))
+
+    hint = font_row.render("[ESC] or click elsewhere to close", True, (70, 70, 95))
+    screen.blit(hint, (px + 10, py + panel_h - 18))
+
+    return option_rects
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     pygame.init()
@@ -876,10 +1083,49 @@ def main():
     player_team = run_menu(screen, clock)
 
     # ── Loading screen → world + entities built in background thread ──────────
-    world_surf, ai_characters, solar_entities = run_loading_screen(screen, clock, player_team)
+    world_surf, ai_characters, solar_entities, asteroids = run_loading_screen(screen, clock, player_team)
     camera = Camera(SCREEN_W, SCREEN_H)
     lasers:     list[Laser]     = []
     explosions: list[Explosion] = []
+
+    # ── Resource & mining state ────────────────────────────────────────────────
+    team_resources: dict         = {0: float(STARTING_RESOURCES), 1: float(STARTING_RESOURCES)}
+    team_special_resources: dict = {0: 0.0, 1: 0.0}
+    miners:         list       = []
+    constructors_by_team       = {e.team: e for e in solar_entities if isinstance(e, Constructor)}
+    planets_by_team: dict      = {}
+    for _e in solar_entities:
+        if isinstance(_e, Planet):
+            planets_by_team.setdefault(_e.team, []).append(_e)
+
+    cargo_ships: list = []
+
+    # Two free starting miners + one cargo ship per team
+    for _team in (0, 1):
+        _con = constructors_by_team.get(_team)
+        if _con:
+            for _ in range(2):
+                miners.append(MinerShip(
+                    _con.wx + _con.radius, _con.wy + _con.radius,
+                    _team, planets_by_team.get(_team, []),
+                ))
+            cargo_ships.append(CargoShip(
+                _con.wx + _con.radius, _con.wy + _con.radius,
+                _team, _con, miners, team_resources, team_special_resources,
+            ))
+
+    # AI team's starting miners auto-assign immediately
+    _ai_team = 1 - player_team
+    for _m in miners:
+        if _m.team == _ai_team:
+            _tp = planets_by_team.get(_ai_team, [])
+            if _tp:
+                _m.send_to(random.choice(_tp))
+
+    constructor_menu_open          = False
+    constructor_menu_ref           = None
+    _build_menu_rects: list        = []   # refreshed each frame when menu is open
+    ai_build_timer                 = 5.0  # seconds until next AI build check
 
     # Start camera centred on the player team's first carrier, or the home star.
     own_carriers = [s for s in ai_characters
@@ -942,6 +1188,9 @@ def main():
             region = world_surf.subsurface(vp_rect)
             pygame.transform.scale(region, (screen_w, screen_h), screen)
 
+        for asteroid in asteroids:
+            asteroid.draw(screen, camera)
+
         for entity in solar_entities:
             if isinstance(entity, Planet):
                 entity.draw(screen, camera, show_orbit=hud_visible)
@@ -950,6 +1199,12 @@ def main():
 
         for ship in ai_characters:
             ship.draw(screen, camera)
+
+        for miner in miners:
+            miner.draw(screen, camera)
+
+        for cargo in cargo_ships:
+            cargo.draw(screen, camera)
 
         for laser in lasers:
             laser.draw(screen, camera)
@@ -972,7 +1227,12 @@ def main():
 
         if hud_visible:
             draw_hud(screen, camera, ai_characters, player_team,
-                     selected_ships, clock.get_fps(), screen_w, screen_h, player_orders)
+                     selected_ships, clock.get_fps(), screen_w, screen_h,
+                     player_orders, team_resources, team_special_resources)
+
+        if constructor_menu_open and constructor_menu_ref is not None:
+            _build_menu_rects[:] = draw_build_menu(
+                screen, constructor_menu_ref, team_resources, player_team)
 
     while True:
         dt        = clock.tick(FPS) / 1000.0
@@ -1007,9 +1267,12 @@ def main():
             if event.type == pygame.KEYDOWN:
                 mods = pygame.key.get_mods()
                 if event.key == pygame.K_ESCAPE:
-                    selected_ships.clear()
-                    player_orders.clear()
-                    cmd_markers.clear()
+                    if constructor_menu_open:
+                        constructor_menu_open = False
+                    else:
+                        selected_ships.clear()
+                        player_orders.clear()
+                        cmd_markers.clear()
                 if event.key == pygame.K_a and (mods & pygame.KMOD_CTRL):
                     selected_ships = [s for s in ai_characters
                                       if s.team == player_team and s.alive]
@@ -1069,29 +1332,45 @@ def main():
                     mods = pygame.key.get_mods()
 
                     if drag_dist < 8:
-                        # Click select
-                        clicked = get_ship_at(ai_characters, camera, ex, ey)
-                        if clicked is None:
-                            # Click on empty space — deselect unless shift held
-                            if not (mods & pygame.KMOD_SHIFT):
-                                selected_ships.clear()
-                        elif clicked.team == player_team:
-                            if mods & pygame.KMOD_SHIFT:
-                                if clicked in selected_ships:
-                                    selected_ships.remove(clicked)
-                                else:
-                                    selected_ships.append(clicked)
+                        if constructor_menu_open:
+                            # Route click into the build menu
+                            for _stype, _rect in _build_menu_rects:
+                                if _rect.collidepoint(ex, ey):
+                                    _cost = SHIP_COSTS.get(_stype, 0)
+                                    if team_resources[player_team] >= _cost:
+                                        team_resources[player_team] -= _cost
+                                        constructor_menu_ref.queue_build(_stype)
+                                    break
+                            constructor_menu_open = False
+                        else:
+                            # Constructor click opens the build menu
+                            _con_hit = _get_constructor_at_screen(
+                                solar_entities, camera, ex, ey)
+                            if _con_hit is not None and _con_hit.team == player_team:
+                                constructor_menu_open = True
+                                constructor_menu_ref  = _con_hit
                             else:
-                                selected_ships = [clicked]
-                        # Clicking an enemy ship without shift just deselects
-                        elif not (mods & pygame.KMOD_SHIFT):
-                            selected_ships.clear()
+                                # Normal ship selection (includes miners)
+                                clicked = get_ship_at(ai_characters + miners, camera, ex, ey)
+                                if clicked is None:
+                                    if not (mods & pygame.KMOD_SHIFT):
+                                        selected_ships.clear()
+                                elif clicked.team == player_team:
+                                    if mods & pygame.KMOD_SHIFT:
+                                        if clicked in selected_ships:
+                                            selected_ships.remove(clicked)
+                                        else:
+                                            selected_ships.append(clicked)
+                                    else:
+                                        selected_ships = [clicked]
+                                elif not (mods & pygame.KMOD_SHIFT):
+                                    selected_ships.clear()
                     else:
                         # Box select — only friendly ships
                         box = pygame.Rect(min(sx, ex), min(sy, ey),
                                           abs(ex - sx), abs(ey - sy))
                         found = get_ships_in_box(
-                            [s for s in ai_characters
+                            [s for s in ai_characters + miners
                              if s.team == player_team and s.alive],
                             camera, box,
                         )
@@ -1139,46 +1418,66 @@ def main():
                     if not queueing:
                         cmd_markers.clear()
                         for s in selected_ships:
-                            s.player_hold = False
+                            if hasattr(s, 'player_hold'):
+                                s.player_hold = False
 
-                    # Formation centroid — moves/attack-moves keep relative spacing
-                    cxs = [s.wx + s.width / 2 for s in selected_ships]
-                    cys = [s.wy + s.height / 2 for s in selected_ships]
-                    cen_x = sum(cxs) / len(cxs)
-                    cen_y = sum(cys) / len(cys)
+                    # ── Miner → planet or asteroid assignment ─────────────────
+                    _clicked_planet   = get_planet_at(solar_entities, camera, cx_s, cy_s)
+                    _clicked_asteroid = (get_asteroid_at(asteroids, camera, cx_s, cy_s)
+                                         if _clicked_planet is None else None)
+                    _clicked_target   = _clicked_planet or _clicked_asteroid
+                    _sel_miners = [s for s in selected_ships
+                                   if isinstance(s, MinerShip) and s.team == player_team]
+                    if _clicked_target is not None and _sel_miners:
+                        _tgt_team = getattr(_clicked_target, 'team', None)
+                        if _tgt_team == player_team or _tgt_team is None:
+                            for _m in _sel_miners:
+                                _m.send_to(_clicked_target)
+                            cmd_markers.append(
+                                (_clicked_target.wx + _clicked_target.radius,
+                                 _clicked_target.wy + _clicked_target.radius))
 
-                    for s, scx, scy in zip(selected_ships, cxs, cys):
-                        s.deployed = True   # ordered out — no longer idling at spawn
+                    # ── Combat orders — miners excluded ────────────────────────
+                    _combat_sel = [s for s in selected_ships
+                                   if not isinstance(s, MinerShip)]
+                    if _combat_sel:
+                        cxs   = [s.wx + s.width  / 2 for s in _combat_sel]
+                        cys   = [s.wy + s.height / 2 for s in _combat_sel]
+                        cen_x = sum(cxs) / len(cxs)
+                        cen_y = sum(cys) / len(cys)
+
+                        for s, scx, scy in zip(_combat_sel, cxs, cys):
+                            s.deployed = True
+                            if target_enemy is not None:
+                                order = {'ship_ref': s, 'type': 'attack', 'target': target_enemy}
+                            elif target_ally is not None:
+                                order = {
+                                    'ship_ref': s, 'type': 'follow', 'target': target_ally,
+                                    'offset': (scx - (target_ally.wx + target_ally.width / 2),
+                                               scy - (target_ally.wy + target_ally.height / 2)),
+                                }
+                            else:
+                                dest = (wx + (scx - cen_x), wy + (scy - cen_y))
+                                order = {
+                                    'ship_ref': s,
+                                    'type':     'attack_move' if attack_move_mod else 'move',
+                                    'pos':      dest,
+                                }
+                                cmd_markers.append(dest)
+
+                            if queueing:
+                                player_orders.setdefault(id(s), []).append(order)
+                            else:
+                                player_orders[id(s)] = [order]
+
                         if target_enemy is not None:
-                            order = {'ship_ref': s, 'type': 'attack', 'target': target_enemy}
+                            tx = target_enemy.wx + target_enemy.width  / 2
+                            ty = target_enemy.wy + target_enemy.height / 2
+                            cmd_markers.append((tx, ty))
                         elif target_ally is not None:
-                            order = {
-                                'ship_ref': s, 'type': 'follow', 'target': target_ally,
-                                'offset': (scx - (target_ally.wx + target_ally.width / 2),
-                                           scy - (target_ally.wy + target_ally.height / 2)),
-                            }
-                        else:
-                            dest = (wx + (scx - cen_x), wy + (scy - cen_y))
-                            order = {
-                                'ship_ref': s,
-                                'type':     'attack_move' if attack_move_mod else 'move',
-                                'pos':      dest,
-                            }
-                            cmd_markers.append(dest)
-
-                        if queueing:
-                            player_orders.setdefault(id(s), []).append(order)
-                        else:
-                            player_orders[id(s)] = [order]
-
-                    if target_enemy is not None:
-                        tx = target_enemy.wx + target_enemy.width  / 2
-                        ty = target_enemy.wy + target_enemy.height / 2
-                        cmd_markers.append((tx, ty))
-                    elif target_ally is not None:
-                        tx = target_ally.wx + target_ally.width  / 2
-                        ty = target_ally.wy + target_ally.height / 2
-                        cmd_markers.append((tx, ty))
+                            tx = target_ally.wx + target_ally.width  / 2
+                            ty = target_ally.wy + target_ally.height / 2
+                            cmd_markers.append((tx, ty))
 
                     cmd_marker_t = 2.5   # show markers for 2.5 seconds
 
@@ -1199,6 +1498,22 @@ def main():
             result = entity.update(dt)
             if result is not None:
                 build_type, sx, sy, team = result
+
+                if build_type == 'MinerShip':
+                    miners.append(MinerShip(
+                        sx, sy, team, planets_by_team.get(team, []),
+                    ))
+                    continue
+
+                if build_type == 'CargoShip':
+                    _con = constructors_by_team.get(team)
+                    if _con:
+                        cargo_ships.append(CargoShip(
+                            sx, sy, team, _con, miners,
+                            team_resources, team_special_resources,
+                        ))
+                    continue
+
                 wp = _make_waypoints(team)
                 if build_type == 'Carrier':
                     ship = Carrier(sx, sy, wp, team=team)
@@ -1347,6 +1662,36 @@ def main():
                 ship._spawn_queue.clear()
         if new_fighters:
             ai_characters.extend(new_fighters)
+
+        # Miner tick
+        for miner in miners:
+            miner.update(dt)
+            miner.wx = max(0.0, min(WORLD_W - miner.width,  miner.wx))
+            miner.wy = max(0.0, min(WORLD_H - miner.height, miner.wy))
+        miners[:] = [m for m in miners if m.alive]
+
+        for cargo in cargo_ships:
+            cargo.update(dt)
+            cargo.wx = max(0.0, min(WORLD_W - cargo.width,  cargo.wx))
+            cargo.wy = max(0.0, min(WORLD_H - cargo.height, cargo.wy))
+        cargo_ships[:] = [c for c in cargo_ships if c.alive]
+
+        # AI build queuing
+        ai_build_timer -= dt
+        if ai_build_timer <= 0.0:
+            ai_build_timer = 6.0
+            _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships, team_resources)
+            # Assign any AI miners that are still idle (planets + asteroids)
+            _ai_targets = planets_by_team.get(enemy_team, []) + [
+                a for a in asteroids if hasattr(a, 'planet_type')]
+            if _ai_targets:
+                for _m in miners:
+                    if _m.team == enemy_team and _m.alive and _m.state == 'idle':
+                        _m.send_to(random.choice(_ai_targets))
+
+        # Asteroid field tick
+        for asteroid in asteroids:
+            asteroid.update(dt)
 
         # Laser and explosion ticks
         for laser in lasers:

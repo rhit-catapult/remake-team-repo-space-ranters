@@ -128,8 +128,8 @@ class Planet(Entity):
 class Constructor(Entity):
     """Ship constructor orbiting the home planet."""
 
-    _BUILD_ORDER = ['Carrier', 'Destroyer', 'AICharacter', 'AICharacter']
-    _COLORS = [(180, 220, 255), (255, 180, 180)]
+    _COLORS     = [(180, 220, 255), (255, 180, 180)]
+    _BUILD_TIME = 12.0   # seconds to complete one queued ship
 
     # Chimney x-offsets as fractions of factory half-width (radius * 4)
     _CHIMNEY_FRACS = (-0.72, -0.36, 0.0, 0.36, 0.72)
@@ -141,9 +141,8 @@ class Constructor(Entity):
         self.orbit_radius = orbit_radius
         self.angle = angle
         self.orbit_speed = orbit_speed
-        self.build_timer = 5.0
-        self.build_interval = 9.0
-        self.built_count = 0
+        self.build_timer = self._BUILD_TIME   # counts down once a job is queued
+        self.build_queue: list = []           # ship-type strings waiting to be built
         self.time = 0.0
         self.smoke_timer = 0.0
         self.smoke = []  # list of [dx, dy, vy, life, max_life, size]
@@ -158,6 +157,16 @@ class Constructor(Entity):
         self._col_mid    = tuple(max(0, c - 45) for c in color)
         self._col_bright = tuple(min(255, c + 60) for c in color)
 
+    def queue_build(self, ship_type: str) -> None:
+        """Add a ship type to the build queue."""
+        self.build_queue.append(ship_type)
+
+    def _build_progress(self) -> float:
+        """0 = idle/just started, 1 = about to complete."""
+        if not self.build_queue:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - self.build_timer / self._BUILD_TIME))
+
     def update(self, dt: float):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
         self.wx = self.home_planet.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
@@ -167,7 +176,7 @@ class Constructor(Entity):
         self.face_angle = self.angle - math.pi * 0.5
 
         self.smoke_timer -= dt
-        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
+        progress = self._build_progress()
         spawn_rate = 0.35 - 0.25 * progress
         if self.smoke_timer <= 0.0:
             self.smoke_timer = spawn_rate
@@ -188,23 +197,18 @@ class Constructor(Entity):
             puff[0] += math.sin(self.time * 1.8 + puff[1] * 0.05) * 8 * dt
         self.smoke = [p for p in self.smoke if p[3] < p[4]]
 
-        self.build_timer -= dt
-        if self.build_timer <= 0.0:
-            self.build_timer += self.build_interval
-            build_type = self._select_build_type()
-            self.built_count += 1
-            return (build_type,
-                    self.wx + self.radius,
-                    self.wy + self.radius,
-                    self.team)
+        if self.build_queue:
+            self.build_timer -= dt
+            if self.build_timer <= 0.0:
+                self.build_timer = self._BUILD_TIME
+                build_type = self.build_queue.pop(0)
+                return (build_type,
+                        self.wx + self.radius,
+                        self.wy + self.radius,
+                        self.team)
+        else:
+            self.build_timer = self._BUILD_TIME   # reset so next job starts promptly
         return None
-
-    def _select_build_type(self) -> str:
-        if self.built_count == 0:
-            return 'Carrier'
-        if self.built_count == 1:
-            return 'Destroyer'
-        return self._BUILD_ORDER[self.built_count % len(self._BUILD_ORDER)]
 
     @staticmethod
     def _poly_points(cx, cy, r, sides, rotation=0.0):
@@ -220,7 +224,7 @@ class Constructor(Entity):
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         r = max(2, int(self.radius * camera.zoom))
         zoom = camera.zoom
-        progress = max(0.0, min(1.0, 1.0 - self.build_timer / self.build_interval))
+        progress = self._build_progress()
 
         col    = self.color
         dark   = self._col_dark
@@ -527,6 +531,589 @@ class DysonNode(Entity):
         if pulse > 0.65:
             pygame.draw.circle(surface, (255, 255, 100), (ant_x, ant_y),
                                max(1, int(2 * zoom)))
+
+
+class MinerShip(Entity):
+    """
+    Flies to a team planet and lands permanently.  Mines indefinitely;
+    CargoShips drain its cargo buffer and ferry resources to the Constructor.
+    """
+
+    SPEED      = 310.0
+    DOCK_RANGE = 300.0
+    _MINE_RATES         = {'rocky': 4.0, 'water': 2.5, 'gas': 3.5, 'home': 7.0,
+                           'asteroid': 3.5}
+    _SPECIAL_MINE_RATE  = 1.8   # glowing asteroids → special resources / sec
+
+    def __init__(self, wx: float, wy: float, team: int, planets: list):
+        color = (200, 235, 255) if team == 0 else (255, 210, 200)
+        super().__init__(wx, wy, 28, 15, color)
+        self.team           = team
+        self.alive          = True
+        self.planets        = planets
+        self.cargo          = 0.0
+        self.special_cargo  = 0.0
+        self.state          = 'idle'
+        self._target        = None
+        self._landed_planet = None
+        self.vx = self.vy   = 0.0
+        self.angle          = 0.0
+        self.time           = 0.0
+
+    def send_to(self, planet) -> None:
+        """Order this miner to fly to and land on planet."""
+        self._target = planet
+        self.state   = 'to_planet'
+
+    def update(self, dt: float) -> None:
+        if not self.alive:
+            return
+        self.time += dt
+
+        if self.state == 'idle':
+            return
+
+        if self.state == 'landed':
+            if self._landed_planet is not None:
+                # Follow the orbiting target (planets orbit; asteroids are static — fine either way)
+                self.wx = self._landed_planet.wx + self._landed_planet.radius - self.width  / 2
+                self.wy = self._landed_planet.wy + self._landed_planet.radius - self.height / 2
+                ptype = getattr(self._landed_planet, 'planet_type', None)
+                if ptype == 'glowing':
+                    self.special_cargo += self._SPECIAL_MINE_RATE * dt
+                else:
+                    self.cargo += self._MINE_RATES.get(ptype, 3.0) * dt
+            return
+
+        if self.state == 'to_planet':
+            if self._target is None:
+                self._select_planet()
+                return
+            tx = self._target.wx + self._target.radius
+            ty = self._target.wy + self._target.radius
+            self._move_toward(tx, ty, dt)
+            if math.hypot(tx - (self.wx + self.width  / 2),
+                          ty - (self.wy + self.height / 2)) < self.DOCK_RANGE:
+                self.state          = 'landed'
+                self._landed_planet = self._target
+
+    def _move_toward(self, tx: float, ty: float, dt: float) -> None:
+        cx   = self.wx + self.width  / 2
+        cy   = self.wy + self.height / 2
+        dx   = tx - cx
+        dy   = ty - cy
+        dist = math.hypot(dx, dy)
+        if dist > 2.0:
+            self.angle = math.atan2(dy, dx)
+            spd = self.SPEED if dist > 350 else self.SPEED * (dist / 350)
+            self.vx = math.cos(self.angle) * spd
+            self.vy = math.sin(self.angle) * spd
+        else:
+            self.vx = self.vy = 0.0
+        self.wx += self.vx * dt
+        self.wy += self.vy * dt
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive or not camera.is_visible(self.world_rect):
+            return
+        cx, cy = camera.world_to_screen(
+            self.wx + self.width  / 2,
+            self.wy + self.height / 2,
+        )
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        L = self.width  / 2 * camera.zoom
+        W = self.height / 2 * camera.zoom
+
+        def ts(lx, ly):
+            return (int(cx + lx * cos_a - ly * sin_a),
+                    int(cy + lx * sin_a + ly * cos_a))
+
+        # Pulsing landing-ring when settled on a planet
+        if self.state == 'landed':
+            pulse    = 0.5 + 0.5 * math.sin(self.time * 2.5)
+            r_ring   = max(6, int((L + W) * 0.75))
+            ring_col = (int(60 * pulse), int(200 * pulse), int(90 * pulse))
+            pygame.draw.circle(surface, ring_col, (cx, cy), r_ring + 2, 1)
+
+        # Boxy utility hull
+        pts = [ts(L, 0), ts(L * 0.3, W), ts(-L, W * 0.7), ts(-L, -W * 0.7), ts(L * 0.3, -W)]
+        pygame.draw.polygon(surface, self.color, pts)
+        rim = (200, 255, 200) if self.state == 'landed' else (255, 255, 255)
+        pygame.draw.polygon(surface, rim, pts, 1)
+
+        # State dot — grey=idle, green=flying, amber=landed & mining
+        dot_col = {'idle': (120, 120, 120), 'to_planet': (80, 210, 80),
+                   'landed': (255, 200, 40)}.get(self.state, (128, 128, 128))
+        ix = int(cx + cos_a * L * 0.55)
+        iy = int(cy + sin_a * L * 0.55)
+        pygame.draw.circle(surface, (0, 0, 0), (ix, iy), 4)
+        pygame.draw.circle(surface, dot_col,   (ix, iy), 3)
+
+        # Cargo bars (stacked): amber = regular, violet = special
+        if self.cargo > 0 or self.special_cargo > 0:
+            bar_w = max(16, int(L * 2.4))
+            bx    = cx - bar_w // 2
+            by    = int(cy - math.hypot(L, W) - 9)
+            if self.cargo > 0:
+                fill_w = max(1, int(bar_w * min(self.cargo, 80.0) / 80.0))
+                pygame.draw.rect(surface, (30,  30,  30),  (bx, by, bar_w, 4))
+                pygame.draw.rect(surface, (70, 210,  90),  (bx, by, fill_w, 4))
+                pygame.draw.rect(surface, (160, 160, 160), (bx, by, bar_w, 4), 1)
+            if self.special_cargo > 0:
+                s_fill = max(1, int(bar_w * min(self.special_cargo, 40.0) / 40.0))
+                sy_bar = by + 6
+                pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 4))
+                pygame.draw.rect(surface, (180,  80, 255),  (bx, sy_bar, s_fill, 4))
+                pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 4), 1)
+
+
+class CargoShip(Entity):
+    """
+    Seeks the landed MinerShip with the most cargo, beams resources aboard,
+    then delivers them to the team's Constructor.
+    """
+
+    SPEED        = 380.0
+    CARGO_CAP    = 120.0
+    LOAD_RATE    = 25.0   # resources per second drained from the miner
+    UNLOAD_RATE  = 35.0   # resources per second deposited at the constructor
+    DOCK_RANGE   = 280.0
+
+    SPECIAL_CAP = 50.0   # separate hold for special resources
+
+    def __init__(self, wx: float, wy: float, team: int,
+                 constructor,
+                 miners_ref: list,         # live reference to the shared miners list
+                 resources: dict,
+                 special_resources: dict):
+        color = (160, 255, 180) if team == 0 else (255, 180, 140)
+        super().__init__(wx, wy, 52, 26, color)
+        self.team              = team
+        self.alive             = True
+        self.constructor       = constructor
+        self._miners_ref       = miners_ref
+        self.resources         = resources
+        self.special_resources = special_resources
+        self.cargo             = 0.0
+        self.special_cargo     = 0.0
+        self.state             = 'seeking'
+        self._target_miner     = None
+        self.vx = self.vy         = 0.0
+        self.angle                = 0.0
+        self.time                 = 0.0
+        self._beam_active         = False
+        self._unload_beam_active  = False
+
+    def update(self, dt: float) -> None:
+        if not self.alive:
+            return
+        self.time             += dt
+        self._beam_active      = False
+        self._unload_beam_active = False
+
+        if self.state == 'seeking':
+            best       = None
+            best_cargo = 8.0
+            for m in self._miners_ref:
+                if (m.team == self.team and m.alive
+                        and m.state == 'landed' and m.cargo > best_cargo):
+                    best_cargo = m.cargo
+                    best       = m
+            if best is not None:
+                self._target_miner = best
+                self.state         = 'to_miner'
+
+        elif self.state == 'to_miner':
+            if self._target_miner is None or not self._target_miner.alive:
+                self.state = 'seeking'
+                return
+            tx = self._target_miner.wx + self._target_miner.width  / 2
+            ty = self._target_miner.wy + self._target_miner.height / 2
+            self._move_toward(tx, ty, dt)
+            if math.hypot(tx - (self.wx + self.width  / 2),
+                          ty - (self.wy + self.height / 2)) < self.DOCK_RANGE:
+                self.state = 'loading'
+
+        elif self.state == 'loading':
+            if self._target_miner is None or not self._target_miner.alive:
+                self.state = 'seeking'
+                return
+            transfer = min(self.LOAD_RATE * dt,
+                           self._target_miner.cargo,
+                           self.CARGO_CAP - self.cargo)
+            self._target_miner.cargo -= transfer
+            self.cargo               += transfer
+            # Also pull special cargo in the same trip
+            s_xfer = min(self.LOAD_RATE * dt,
+                         self._target_miner.special_cargo,
+                         self.SPECIAL_CAP - self.special_cargo)
+            self._target_miner.special_cargo -= s_xfer
+            self.special_cargo               += s_xfer
+            self._beam_active = True
+            if (self.cargo >= self.CARGO_CAP
+                    or (self._target_miner.cargo < 0.5
+                        and self._target_miner.special_cargo < 0.5)):
+                self._beam_active  = False
+                self._target_miner = None
+                self.state         = 'to_constructor'
+
+        elif self.state == 'to_constructor':
+            tx = self.constructor.wx + self.constructor.radius
+            ty = self.constructor.wy + self.constructor.radius
+            self._move_toward(tx, ty, dt)
+            if math.hypot(tx - (self.wx + self.width  / 2),
+                          ty - (self.wy + self.height / 2)) < self.DOCK_RANGE:
+                self.state = 'depositing'
+
+        elif self.state == 'depositing':
+            transfer = min(self.UNLOAD_RATE * dt, self.cargo)
+            self.cargo -= transfer
+            self.resources[self.team] = self.resources.get(self.team, 0.0) + transfer
+            s_xfer = min(self.UNLOAD_RATE * dt, self.special_cargo)
+            self.special_cargo -= s_xfer
+            self.special_resources[self.team] = (
+                self.special_resources.get(self.team, 0.0) + s_xfer)
+            self._unload_beam_active = True
+            if self.cargo < 0.5 and self.special_cargo < 0.5:
+                self.cargo               = 0.0
+                self.special_cargo       = 0.0
+                self._unload_beam_active = False
+                self.state               = 'seeking'
+
+    def _move_toward(self, tx: float, ty: float, dt: float) -> None:
+        cx   = self.wx + self.width  / 2
+        cy   = self.wy + self.height / 2
+        dx   = tx - cx
+        dy   = ty - cy
+        dist = math.hypot(dx, dy)
+        if dist > 2.0:
+            self.angle = math.atan2(dy, dx)
+            spd = self.SPEED if dist > 350 else self.SPEED * (dist / 350)
+            self.vx = math.cos(self.angle) * spd
+            self.vy = math.sin(self.angle) * spd
+        else:
+            self.vx = self.vy = 0.0
+        self.wx += self.vx * dt
+        self.wy += self.vy * dt
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        if not self.alive:
+            return
+
+        # Unload beam: cargo ship → constructor (gold/amber, drawn before vis check)
+        if self._unload_beam_active:
+            tx = self.constructor.wx + self.constructor.radius
+            ty = self.constructor.wy + self.constructor.radius
+            bsx, bsy = camera.world_to_screen(
+                self.wx + self.width  / 2,
+                self.wy + self.height / 2,
+            )
+            esx, esy = camera.world_to_screen(tx, ty)
+            pulse = 0.55 + 0.45 * math.sin(self.time * 10.0)
+            lw    = max(2, int(3 * camera.zoom))
+            pygame.draw.line(surface, (70, 35, 0),
+                             (bsx, bsy), (esx, esy), lw + 3)
+            pygame.draw.line(surface,
+                             (int(200 + 55 * pulse),
+                              int(130 + 70 * pulse),
+                              int(10  + 20 * pulse)),
+                             (bsx, bsy), (esx, esy), lw)
+            pygame.draw.line(surface, (255, 230, 80),
+                             (bsx, bsy), (esx, esy), max(1, lw - 1))
+            # Pulsing glow at the constructor end
+            r_glow = max(4, int(16 * pulse * camera.zoom))
+            for step in range(4, 0, -1):
+                frac = step / 4
+                gc = (int(255 * frac * pulse),
+                      int(180 * frac * pulse),
+                      int(20  * frac * pulse))
+                pygame.draw.circle(surface, gc, (esx, esy), int(r_glow * frac))
+
+        # Load beam: miner → cargo ship (green, drawn before vis check)
+        if self._beam_active and self._target_miner is not None:
+            mx  = self._target_miner.wx + self._target_miner.width  / 2
+            my  = self._target_miner.wy + self._target_miner.height / 2
+            bsx, bsy = camera.world_to_screen(mx, my)
+            esx, esy = camera.world_to_screen(
+                self.wx + self.width  / 2,
+                self.wy + self.height / 2,
+            )
+            pulse = 0.55 + 0.45 * math.sin(self.time * 14.0)
+            lw    = max(2, int(3 * camera.zoom))
+            pygame.draw.line(surface, (10, 60, 10),
+                             (bsx, bsy), (esx, esy), lw + 3)
+            pygame.draw.line(surface,
+                             (int(60  + 100 * pulse),
+                              int(200 +  55 * pulse),
+                              int(60  + 100 * pulse)),
+                             (bsx, bsy), (esx, esy), lw)
+            pygame.draw.line(surface, (210, 255, 210),
+                             (bsx, bsy), (esx, esy), max(1, lw - 1))
+
+        if not camera.is_visible(self.world_rect):
+            return
+
+        cx, cy = camera.world_to_screen(
+            self.wx + self.width  / 2,
+            self.wy + self.height / 2,
+        )
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        L = self.width  / 2 * camera.zoom
+        W = self.height / 2 * camera.zoom
+
+        def ts(lx, ly):
+            return (int(cx + lx * cos_a - ly * sin_a),
+                    int(cy + lx * sin_a + ly * cos_a))
+
+        fill   = min(self.cargo / self.CARGO_CAP, 1.0)
+        active = self.state in ('loading', 'depositing')
+        pulse  = (0.72 + 0.28 * math.sin(self.time * 8.0)) if active else 1.0
+
+        # ── Cargo hold interior (drawn first, behind the hull) ────────────
+        hold_pts = [
+            ts( L * 0.32,  W * 0.66),
+            ts(-L * 0.22,  W * 0.80),
+            ts(-L * 0.70,  W * 0.70),
+            ts(-L * 0.86,  0        ),
+            ts(-L * 0.70, -W * 0.70),
+            ts(-L * 0.22, -W * 0.80),
+            ts( L * 0.32, -W * 0.66),
+        ]
+        # Empty → dark blue-grey; Full → bright amber-gold
+        hr = int(22  + 233 * fill * pulse)
+        hg = int(18  + 152 * fill * pulse)
+        hb = int(38  -  18 * fill)
+        pygame.draw.polygon(surface,
+                            (min(255, hr), min(255, hg), max(0, hb)),
+                            hold_pts)
+
+        # Four cargo-level indicator dots along the hold (back → front)
+        n_pips = 4
+        for i in range(n_pips):
+            lit   = fill >= (i + 1) / n_pips
+            t_pos = -L * 0.65 + L * 1.1 * (i / (n_pips - 1))
+            # screen position of the dot (offset perpendicular to heading)
+            pip_pulse = pulse if (active and lit) else 1.0
+            pip_col   = (
+                min(255, int(60  + 195 * lit * pip_pulse)),
+                min(255, int(45  + 130 * lit * pip_pulse)),
+                int(8 * lit),
+            ) if lit else (28, 28, 38)
+            r_pip = max(2, int(2.5 * camera.zoom))
+            for sign in (-1, 1):
+                px = int(cx + cos_a * t_pos - sin_a * (W * 0.52 * sign))
+                py = int(cy + sin_a * t_pos + cos_a * (W * 0.52 * sign))
+                pygame.draw.circle(surface, (0, 0, 0), (px, py), r_pip + 1)
+                pygame.draw.circle(surface, pip_col,   (px, py), r_pip)
+
+        # ── Outer hull ───────────────────────────────────────────────────
+        hull_pts = [
+            ts( L,         0        ),
+            ts( L * 0.50,  W * 0.88 ),
+            ts(-L * 0.20,  W        ),
+            ts(-L * 0.68,  W * 0.90 ),
+            ts(-L,         W * 0.40 ),
+            ts(-L,        -W * 0.40 ),
+            ts(-L * 0.68, -W * 0.90 ),
+            ts(-L * 0.20, -W        ),
+            ts( L * 0.50, -W * 0.88 ),
+        ]
+        pygame.draw.polygon(surface, self.color, hull_pts)
+        rim_col = (int(255 * pulse), int(220 * pulse), 80) if (active and fill > 0.05) \
+                  else (180, 180, 180)
+        pygame.draw.polygon(surface, rim_col, hull_pts, 1)
+
+        # Engine glow at stern
+        eng_px = int(cx - cos_a * L)
+        eng_py = int(cy - sin_a * L)
+        r_eng  = max(2, int(W * 0.38))
+        ep     = 0.6 + 0.4 * math.sin(self.time * 5.5 + 1.2)
+        pygame.draw.circle(surface,
+                           (int(70 * ep), int(110 * ep), int(255 * ep)),
+                           (eng_px, eng_py), r_eng + 1)
+        pygame.draw.circle(surface, (160, 200, 255), (eng_px, eng_py), max(1, r_eng - 1))
+
+        # ── State dot ────────────────────────────────────────────────────
+        _state_col = {
+            'seeking':        (160, 160, 160),
+            'to_miner':       (80,  210,  80),
+            'loading':        (80,  255, 120),
+            'to_constructor': (80,  160, 255),
+            'depositing':     (255, 200,  40),
+        }
+        dot_col = _state_col.get(self.state, (128, 128, 128))
+        ix = int(cx + cos_a * L * 0.48)
+        iy = int(cy + sin_a * L * 0.48)
+        pygame.draw.circle(surface, (0, 0, 0), (ix, iy), 4)
+        pygame.draw.circle(surface, dot_col,   (ix, iy), 3)
+
+        # Purple hull aura when carrying special cargo
+        if self.special_cargo > 0.5:
+            s_fill  = min(self.special_cargo / self.SPECIAL_CAP, 1.0)
+            sp      = (0.65 + 0.35 * math.sin(self.time * 7.0)) if active else 0.8
+            r_aura  = max(5, int(math.hypot(L, W) * 1.15))
+            for step in range(3, 0, -1):
+                frac = step / 3
+                gc = (int(120 * frac * s_fill * sp),
+                      int(30  * frac * s_fill * sp),
+                      int(180 * frac * s_fill * sp))
+                pygame.draw.circle(surface, gc, (cx, cy), int(r_aura * frac))
+
+        # ── Cargo bars above the ship ─────────────────────────────────────
+        if self.cargo > 0 or self.special_cargo > 0:
+            bar_w = max(20, int(L * 2.6))
+            bx    = cx - bar_w // 2
+            by    = int(cy - math.hypot(L, W) - 12)
+            if self.cargo > 0:
+                fill_w  = max(1, int(bar_w * fill))
+                bar_col = (min(255, int(80 + 175 * fill)),
+                           min(255, int(200 - 40  * fill)), 20)
+                pygame.draw.rect(surface, (25, 25, 25),   (bx, by, bar_w, 5))
+                pygame.draw.rect(surface, bar_col,         (bx, by, fill_w, 5))
+                pygame.draw.rect(surface, (140, 140, 140), (bx, by, bar_w, 5), 1)
+            if self.special_cargo > 0:
+                s_f    = min(self.special_cargo / self.SPECIAL_CAP, 1.0)
+                s_fill = max(1, int(bar_w * s_f))
+                sy_bar = by + 7
+                pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 5))
+                pygame.draw.rect(surface, (180,  80, 255), (bx, sy_bar, s_fill, 5))
+                pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 5), 1)
+
+
+class GlowingAsteroid:
+    """
+    A static, glowing space rock.  Position never changes; only the pulse
+    and glow are animated each frame.
+    """
+
+    _GLOW_PALETTE = [
+        (80,  200, 255),   # icy blue-white
+        (255, 200,  80),   # amber
+        (120, 255, 140),   # pale green
+        (200, 110, 255),   # violet
+        (255, 130, 100),   # orange-red
+    ]
+
+    planet_type = 'glowing'
+    team        = None            # neutral — any miner can target it
+
+    def __init__(self, wx: float, wy: float):
+        self.wx     = wx
+        self.wy     = wy
+        self.radius = random.randint(55, 120)
+        self.width  = self.radius * 2
+        self.height = self.radius * 2
+        self.angle  = random.uniform(0.0, math.tau)
+        self.time   = random.uniform(0.0, 12.0)   # phase offset so each rock pulses differently
+
+        n = random.randint(7, 11)
+        self._shape = []
+        for i in range(n):
+            a = i * math.tau / n + random.uniform(-0.25, 0.25)
+            r = self.radius * random.uniform(0.55, 1.0)
+            self._shape.append((math.cos(a) * r, math.sin(a) * r))
+
+        self.glow_color  = random.choice(self._GLOW_PALETTE)
+        self._rock_color = (168, 162, 155)
+        self._rock_rim   = (210, 205, 200)
+
+    def update(self, dt: float) -> None:
+        self.time += dt
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        pad = self.radius
+        if not camera.is_visible_xywh(self.wx - pad, self.wy - pad, pad * 2, pad * 2):
+            return
+
+        sx, sy = camera.world_to_screen(self.wx, self.wy)
+        zoom   = camera.zoom
+        pulse  = 0.5 + 0.5 * math.sin(self.time * 1.6)
+        r_scr  = max(2, int(self.radius * zoom))
+
+        # Outer glow rings
+        for step in range(5, 0, -1):
+            glow_r = r_scr + int(step * 9 * zoom)
+            frac   = (step / 5) * pulse * 0.45
+            gc = (
+                int(self.glow_color[0] * frac),
+                int(self.glow_color[1] * frac),
+                int(self.glow_color[2] * frac),
+            )
+            if glow_r > 1:
+                pygame.draw.circle(surface, gc, (sx, sy), glow_r)
+
+        # Rock body
+        cos_a = math.cos(self.angle)
+        sin_a = math.sin(self.angle)
+        pts   = [
+            (sx + int((lx * cos_a - ly * sin_a) * zoom),
+             sy + int((lx * sin_a + ly * cos_a) * zoom))
+            for lx, ly in self._shape
+        ]
+        if len(pts) >= 3:
+            pygame.draw.polygon(surface, self._rock_color, pts)
+            pygame.draw.polygon(surface, self._rock_rim,   pts, max(1, int(zoom)))
+
+        # Bright core
+        core_r = max(2, int(r_scr * 0.28))
+        core_c = tuple(min(255, int(c * (0.6 + 0.4 * pulse))) for c in self.glow_color)
+        pygame.draw.circle(surface, core_c, (sx, sy), core_r)
+
+
+class MineableAsteroid:
+    """
+    A large, interactable asteroid visible above the background.
+    Any miner can land on it to gather regular resources.
+    """
+
+    MINE_RATE   = 3.5
+    planet_type = 'asteroid'
+    team        = None
+
+    def __init__(self, wx: float, wy: float):
+        self.wx     = wx
+        self.wy     = wy
+        self.radius = random.randint(70, 140)
+        self.width  = self.radius * 2
+        self.height = self.radius * 2
+        self.alive  = True
+        self.time   = 0.0
+
+        n = random.randint(7, 11)
+        self._shape = []
+        for i in range(n):
+            a = i * math.tau / n + random.uniform(-0.3, 0.3)
+            r = self.radius * random.uniform(0.60, 1.0)
+            self._shape.append((math.cos(a) * r, math.sin(a) * r))
+
+        self._col_fill = (138, 132, 124)
+        self._col_rim  = (195, 190, 185)
+
+    def update(self, dt: float) -> None:
+        pass
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        pad = self.radius
+        if not camera.is_visible_xywh(self.wx - pad, self.wy - pad, pad * 2, pad * 2):
+            return
+        cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
+        z      = camera.zoom
+        pts    = [
+            (int(cx + lx * z), int(cy + ly * z))
+            for lx, ly in self._shape
+        ]
+        if len(pts) >= 3:
+            pygame.draw.polygon(surface, self._col_fill, pts)
+            pygame.draw.polygon(surface, self._col_rim,  pts, max(1, int(2 * z)))
+        # Subtle outer ring so the player can distinguish it from the painted background
+        r_out = max(4, int(self.radius * z * 1.12))
+        pygame.draw.circle(surface, (170, 165, 160), (cx, cy), r_out, max(1, int(z)))
+        # Pickaxe-like cross to signal "mineable"
+        arm = max(4, int(self.radius * z * 0.25))
+        pygame.draw.line(surface, (220, 210, 200), (cx - arm, cy), (cx + arm, cy), max(1, int(z)))
+        pygame.draw.line(surface, (220, 210, 200), (cx, cy - arm), (cx, cy + arm), max(1, int(z)))
 
 
 # Team colour palettes: index 0 = team 0 (blue), index 1 = team 1 (red)
