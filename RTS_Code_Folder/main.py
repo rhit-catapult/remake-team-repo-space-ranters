@@ -101,7 +101,11 @@ MATERIAL_COLOR = {
     'uranium':  ( 80, 255, 100),
 }
 
-STARTING_MATERIALS = {'iron': 80}
+STARTING_MATERIALS = {
+    'iron':   80,
+    'nickel': 20,
+    'copper': 25,
+}
 
 SHIP_COSTS = {
     'MinerShip':   {'iron': 10, 'nickel': 5},
@@ -564,9 +568,7 @@ def _build_solar_system(team):
                    planet_type, team, radius)
         )
     home_planet = next(p for p in planets if p.planet_type == 'home')
-    constructor = Constructor(home_planet, orbit_radius=home_planet.orbit_radius,
-                              angle=home_planet.angle + math.pi,
-                              team=team, orbit_speed=home_planet.orbit_speed)
+    constructor = Constructor(home_planet, team=team)
 
     dyson_sphere = DysonSphere(star_x, star_y, star_radius=578, team=team)
     dyson_orbit = dyson_sphere.orbit_radius
@@ -584,6 +586,9 @@ _ASTEROID_TOTAL   = 320   # total rocks in the diagonal field
 _ASTEROID_GLOW_NTH =  25   # every Nth rock is a live glowing entity; rest baked into bg
 
 _ASTEROID_MINEABLE_N = 12   # number of large interactable asteroid entities
+
+_SHIP_SEP_DIST  = 180.0   # world units — all ships push apart when closer than this
+_SHIP_SEP_FORCE = 150.0   # separation push strength (applied as position nudge for eco ships, velocity for combat)
 
 # Respawn: when alive counts fall below these, new asteroids are spawned
 _RESPAWN_MIN_ORE   = 4   # minimum live MineableAsteroids before new ones appear
@@ -643,61 +648,11 @@ def _build_asteroid_field(world_surf: pygame.Surface,
     return glowing + mineable
 
 
-def setup_game():
+def setup_game():  # both sides start with resources only, no pre-built ships
     solar_entities = []
-    constructors = {}
     for team in (0, 1):
-        solar_team = _build_solar_system(team)
-        solar_entities.extend(solar_team)
-        constructor = next((e for e in solar_team if isinstance(e, Constructor)), None)
-        if constructor:
-            constructors[team] = constructor
-
-    # Spawn initial fleets from constructors
+        solar_entities.extend(_build_solar_system(team))
     ai_characters = []
-    for team in (0, 1):
-        if team not in constructors:
-            continue
-        constructor = constructors[team]
-        cx = constructor.wx + constructor.radius
-        cy = constructor.wy + constructor.radius
-
-        # Initial fleet: 1 carrier + 2 destroyers + 6 frigates
-        wp_carrier = _make_waypoints(team)
-        carrier = Carrier(cx, cy, wp_carrier, team=team)
-        carrier.wx -= carrier.width / 2
-        carrier.wy -= carrier.height / 2
-        carrier.deployed = False
-        carrier.home_pos = (carrier.wx + carrier.width / 2, carrier.wy + carrier.height / 2)
-        carrier.fleet_leader = carrier
-        ai_characters.append(carrier)
-
-        for d_idx in range(2):
-            wp_destroyer = _make_waypoints(team)
-            destroyer = Destroyer(cx + (d_idx - 0.5) * 100, cy + 80, wp_destroyer, team=team)
-            destroyer.wx -= destroyer.width / 2
-            destroyer.wy -= destroyer.height / 2
-            destroyer.deployed = False
-            destroyer.home_pos = (destroyer.wx + destroyer.width / 2,
-                                   destroyer.wy + destroyer.height / 2)
-            destroyer.fleet_leader = carrier
-            destroyer.fleet_offset = (0.0, (1 if d_idx % 2 == 0 else -1) * 550.0)
-            destroyer.fleet_stray_dist = 900.0
-            ai_characters.append(destroyer)
-
-        for f_idx in range(6):
-            wp_frigate = _make_waypoints(team)
-            frigate = AICharacter(cx - 150 + (f_idx % 3) * 100,
-                                  cy + 150 + (f_idx // 3) * 100,
-                                  wp_frigate, team=team)
-            frigate.deployed = False
-            frigate.home_pos = (frigate.wx + frigate.width / 2, frigate.wy + frigate.height / 2)
-            frigate.fleet_leader = carrier
-            angle = (f_idx * (math.tau / 6))
-            radius = 280
-            frigate.fleet_offset = (math.cos(angle) * radius, math.sin(angle) * radius)
-            frigate.fleet_stray_dist = 450
-            ai_characters.append(frigate)
 
     return ai_characters, solar_entities
 
@@ -907,47 +862,39 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
             type_str += "   [HOLD FIRE]"
 
         # ── Miner resource info ───────────────────────────────────────────────
-        _PTYPE_RESOURCE = {
-            'rocky': 'Iron', 'home': 'Iron+Copper',
-            'water': 'Copper', 'gas': 'Fuel',
-            'asteroid': 'Titanium', 'glowing': 'Crystal',
-        }
-        _RESOURCE_COL = {
-            'Iron':        (180, 130,  80),
-            'Iron+Copper': (200, 135,  60),
-            'Copper':      (210, 140,  40),
-            'Titanium':    (150, 200, 230),
-            'Crystal':     (190, 100, 255),
-            'Fuel':        (220, 200,  70),
-        }
+        def _entity_res_str(entity):
+            """Return (abbrev_string, color) describing what an entity yields."""
+            ylds = getattr(entity, 'yields', {})
+            mats = list(ylds.keys())
+            if not mats:
+                return getattr(entity, 'planet_type', '?').title(), (180, 180, 180)
+            name = '+'.join(MATERIAL_ABBREV.get(m, m.title()) for m in mats[:2])
+            col  = MATERIAL_COLOR.get(mats[0], (200, 200, 200))
+            return name, col
+
         miners_sel = [s for s in selected_ships if type(s).__name__ == 'MinerShip']
         miner_info_surfs = []
         if miners_sel:
             if len(miners_sel) == 1:
                 m = miners_sel[0]
-                ptype = getattr(getattr(m, '_landed_planet', None), 'planet_type', None)
-                if m.state == 'landed' and ptype:
-                    res_name = _PTYPE_RESOURCE.get(ptype, ptype.title())
-                    col      = _RESOURCE_COL.get(res_name, (200, 200, 200))
-                    label    = f"Mining: {res_name}  ({ptype} planet)"
-                    miner_info_surfs.append((font_sm.render(label, True, col), col))
-                elif m.state == 'to_planet':
-                    ptype = getattr(getattr(m, '_target', None), 'planet_type', None)
-                    res_name = _PTYPE_RESOURCE.get(ptype, '?') if ptype else '?'
-                    col      = _RESOURCE_COL.get(res_name, (160, 160, 160))
+                if m.state == 'landed' and m._landed_planet is not None:
+                    res_name, col = _entity_res_str(m._landed_planet)
+                    ptype = getattr(m._landed_planet, 'planet_type', '')
+                    miner_info_surfs.append((font_sm.render(f"Mining: {res_name}  ({ptype})", True, col), col))
+                elif m.state == 'to_planet' and m._target is not None:
+                    res_name, col = _entity_res_str(m._target)
+                    col = tuple(max(0, c - 40) for c in col)
                     miner_info_surfs.append((font_sm.render(f"En route → {res_name}", True, col), col))
                 else:
                     miner_info_surfs.append((font_sm.render("Idle", True, (140, 140, 140)), (140, 140, 140)))
             else:
-                # Summarise across multiple miners
                 counts: dict = {}
                 idle = 0
                 for m in miners_sel:
-                    ptype = getattr(getattr(m, '_landed_planet', None), 'planet_type', None)
-                    if not ptype and m.state == 'to_planet':
-                        ptype = getattr(getattr(m, '_target', None), 'planet_type', None)
-                    if ptype:
-                        res_name = _PTYPE_RESOURCE.get(ptype, ptype.title())
+                    entity = m._landed_planet if m.state == 'landed' else (
+                             m._target if m.state == 'to_planet' else None)
+                    if entity is not None:
+                        res_name, _ = _entity_res_str(entity)
                         counts[res_name] = counts.get(res_name, 0) + 1
                     else:
                         idle += 1
@@ -1029,6 +976,88 @@ def draw_hud(screen, camera, ai_characters, player_team, selected_ships,
     bx = screen_w // 2 - _hud_banner_surf.get_width() // 2
     screen.blit(_hud_banner_bg,  (bx - 10, 8))
     screen.blit(_hud_banner_surf, (bx, 12))
+
+
+# ── Planet info panel ────────────────────────────────────────────────────────
+
+def draw_planet_info(screen, planet, screen_w):
+    """Draw a small panel showing the selected planet's type and harvestable materials."""
+    font_sm, font_med, _ = _fonts()
+    ylds      = getattr(planet, 'yields', {})
+    materials = list(ylds.keys())
+
+    panel_w = 210
+    row_h   = 20
+    panel_h = 10 + 24 + 16 + len(materials) * row_h + 8
+
+    px = screen_w - panel_w - 10
+    py = 152  # below minimap (10 + 120 + label)
+
+    surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 185))
+    pygame.draw.rect(surf, (80, 80, 110), (0, 0, panel_w, panel_h), 1)
+
+    type_label = 'Home Planet' if planet.planet_type == 'home' else planet.planet_type.title() + ' Planet'
+    surf.blit(font_med.render(type_label, True, (220, 220, 255)), (8, 6))
+
+    y = 32
+    surf.blit(font_sm.render('Materials:', True, (160, 160, 180)), (8, y))
+    y += 18
+
+    for mat in materials:
+        col    = MATERIAL_COLOR.get(mat, (200, 200, 200))
+        abbrev = MATERIAL_ABBREV.get(mat, mat.title())
+        rate   = ylds[mat]
+        pygame.draw.circle(surf, col, (14, y + 7), 5)
+        surf.blit(font_sm.render(f'{abbrev}  {mat.title()}  {rate}/s', True, col), (26, y))
+        y += row_h
+
+    screen.blit(surf, (px, py))
+
+
+def draw_asteroid_info(screen, asteroid, screen_w):
+    """Draw a small panel showing the selected asteroid's materials and remaining resources."""
+    font_sm, font_med, _ = _fonts()
+    ylds      = getattr(asteroid, 'yields', {})
+    materials = list(ylds.keys())
+    res_frac  = max(0.0, asteroid.resources / asteroid.max_resources) if asteroid.max_resources else 0.0
+
+    panel_w = 210
+    row_h   = 20
+    panel_h = 10 + 24 + 16 + len(materials) * row_h + 26 + 8
+
+    px = screen_w - panel_w - 10
+    py = 152
+
+    surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 185))
+    pygame.draw.rect(surf, (80, 80, 110), (0, 0, panel_w, panel_h), 1)
+
+    type_label = 'Glowing Asteroid' if asteroid.planet_type == 'glowing' else 'Asteroid'
+    surf.blit(font_med.render(type_label, True, (220, 220, 255)), (8, 6))
+
+    y = 32
+    surf.blit(font_sm.render('Materials:', True, (160, 160, 180)), (8, y))
+    y += 18
+
+    for mat in materials:
+        col    = MATERIAL_COLOR.get(mat, (200, 200, 200))
+        abbrev = MATERIAL_ABBREV.get(mat, mat.title())
+        rate   = ylds[mat]
+        pygame.draw.circle(surf, col, (14, y + 7), 5)
+        surf.blit(font_sm.render(f'{abbrev}  {mat.title()}  {rate}/s', True, col), (26, y))
+        y += row_h
+
+    y += 4
+    bar_w  = panel_w - 16
+    bar_h  = 6
+    fill_w = max(0, int(bar_w * res_frac))
+    pygame.draw.rect(surf, (40, 30, 50), (8, y, bar_w, bar_h))
+    bar_col = (190, 100, 255) if asteroid.planet_type == 'glowing' else (200, 160, 60)
+    pygame.draw.rect(surf, bar_col, (8, y, fill_w, bar_h))
+    surf.blit(font_sm.render(f'{int(res_frac * 100)}% remaining', True, (150, 150, 170)), (8, y + 9))
+
+    screen.blit(surf, (px, py))
 
 
 # ── Quit confirmation ────────────────────────────────────────────────────────
@@ -1401,6 +1430,8 @@ def main():
 
     constructor_menu_open          = False
     constructor_menu_ref           = None
+    selected_planet                = None
+    selected_asteroid              = None
     _build_menu_rects: list        = []   # (ship_type, rect) build buttons
     _build_cancel_rects: list      = []   # (queue_index, rect) X cancel buttons
     _build_clear_rects: list       = []   # 0 or 1 element: the Clear All rect
@@ -1495,6 +1526,7 @@ def main():
         for ship in selected_ships:
             draw_selection_ring(screen, camera, ship, elapsed, player_team)
 
+
         # Command destination markers
         marker_col = TEAM_COLORS[player_team]
         for wx2, wy2 in cmd_markers:
@@ -1508,6 +1540,12 @@ def main():
             draw_hud(screen, camera, ai_characters, player_team,
                      selected_ships, clock.get_fps(), screen_w, screen_h,
                      player_orders, team_materials)
+
+        if hud_visible and selected_planet is not None:
+            draw_planet_info(screen, selected_planet, screen_w)
+
+        if hud_visible and selected_asteroid is not None and selected_asteroid.alive:
+            draw_asteroid_info(screen, selected_asteroid, screen_w)
 
         if constructor_menu_open and constructor_menu_ref is not None:
             _opt, _cxl, _clr = draw_build_menu(
@@ -1645,6 +1683,8 @@ def main():
                             if not _clicked_menu:
                                 constructor_menu_open = False
                         else:
+                            selected_planet   = None
+                            selected_asteroid = None
                             # Constructor click opens the build menu
                             _con_hit = _get_constructor_at_screen(
                                 solar_entities, camera, ex, ey)
@@ -1652,21 +1692,33 @@ def main():
                                 constructor_menu_open = True
                                 constructor_menu_ref  = _con_hit
                             else:
-                                # Normal ship selection (includes miners)
-                                clicked = get_ship_at(ai_characters + miners, camera, ex, ey)
-                                if clicked is None:
-                                    if not (mods & pygame.KMOD_SHIFT):
-                                        selected_ships.clear()
-                                elif clicked.team == player_team:
-                                    if mods & pygame.KMOD_SHIFT:
-                                        if clicked in selected_ships:
-                                            selected_ships.remove(clicked)
-                                        else:
-                                            selected_ships.append(clicked)
-                                    else:
-                                        selected_ships = [clicked]
-                                elif not (mods & pygame.KMOD_SHIFT):
+                                # Planet click shows info panel
+                                _planet_hit = get_planet_at(solar_entities, camera, ex, ey)
+                                if _planet_hit is not None:
+                                    selected_planet = _planet_hit
                                     selected_ships.clear()
+                                else:
+                                    # Asteroid click shows info panel
+                                    _asteroid_hit = get_asteroid_at(asteroids, camera, ex, ey)
+                                    if _asteroid_hit is not None:
+                                        selected_asteroid = _asteroid_hit
+                                        selected_ships.clear()
+                                    else:
+                                        # Normal ship selection (includes miners)
+                                        clicked = get_ship_at(ai_characters + miners, camera, ex, ey)
+                                        if clicked is None:
+                                            if not (mods & pygame.KMOD_SHIFT):
+                                                selected_ships.clear()
+                                        elif clicked.team == player_team:
+                                            if mods & pygame.KMOD_SHIFT:
+                                                if clicked in selected_ships:
+                                                    selected_ships.remove(clicked)
+                                                else:
+                                                    selected_ships.append(clicked)
+                                            else:
+                                                selected_ships = [clicked]
+                                        elif not (mods & pygame.KMOD_SHIFT):
+                                            selected_ships.clear()
                     else:
                         # Box select — only friendly ships
                         box = pygame.Rect(min(sx, ex), min(sy, ey),
@@ -2129,6 +2181,27 @@ def main():
                 ship._spawn_queue.clear()
         if new_fighters:
             ai_characters.extend(new_fighters)
+
+        # ── Global separation pass — all same-team ships push apart ──────────
+        _sep_pool = [s for s in (ai_characters + miners + cargo_ships)
+                     if getattr(s, 'alive', True)]
+        for _si, _sa in enumerate(_sep_pool):
+            _cx_a = _sa.wx + _sa.width  / 2
+            _cy_a = _sa.wy + _sa.height / 2
+            for _sb in _sep_pool[_si + 1:]:
+                if _sa.team != _sb.team:
+                    continue
+                _cx_b = _sb.wx + _sb.width  / 2
+                _cy_b = _sb.wy + _sb.height / 2
+                _d = math.hypot(_cx_b - _cx_a, _cy_b - _cy_a)
+                if 0 < _d < _SHIP_SEP_DIST:
+                    _str = (_SHIP_SEP_DIST - _d) / _SHIP_SEP_DIST * _SHIP_SEP_FORCE
+                    _nx  = (_cx_a - _cx_b) / _d
+                    _ny  = (_cy_a - _cy_b) / _d
+                    _sa._sep_ax += _nx * _str
+                    _sa._sep_ay += _ny * _str
+                    _sb._sep_ax -= _nx * _str
+                    _sb._sep_ay -= _ny * _str
 
         # Miner tick
         for miner in miners:

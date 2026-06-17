@@ -6,6 +6,11 @@ import math
 import random
 import pygame
 
+_ALL_MATERIALS = [
+    'iron', 'nickel', 'copper', 'silicon', 'ice',
+    'helium3', 'fuel', 'titanium', 'platinum', 'crystal', 'uranium',
+]
+
 
 class Entity:
     """Base class. Lives in world space; knows nothing about the screen."""
@@ -102,6 +107,9 @@ class Planet(Entity):
         super().__init__(star_x + math.cos(angle) * orbit_radius - radius,
                          star_y + math.sin(angle) * orbit_radius - radius,
                          radius * 2, radius * 2, color)
+        _n = random.randint(2, 3)
+        _chosen = random.sample(_ALL_MATERIALS, _n)
+        self.yields = {m: round(random.uniform(1.5, 3.5), 1) for m in _chosen}
 
     def update(self, dt: float):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
@@ -126,33 +134,25 @@ class Planet(Entity):
 
 
 class Constructor(Entity):
-    """Ship constructor orbiting the home planet."""
+    """Ship constructor stationed on the home planet."""
 
     _COLORS     = [(180, 220, 255), (255, 180, 180)]
     _BUILD_TIME = 12.0   # seconds to complete one queued ship
 
-    # Chimney x-offsets as fractions of factory half-width (radius * 4)
-    _CHIMNEY_FRACS = (-0.72, -0.36, 0.0, 0.36, 0.72)
-
-    def __init__(self, home_planet: Planet, orbit_radius: float,
-                 angle: float, team: int, orbit_speed: float = 0.9):
+    def __init__(self, home_planet: Planet, team: int):
         self.home_planet = home_planet
         self.team = team
-        self.orbit_radius = orbit_radius
-        self.angle = angle
-        self.orbit_speed = orbit_speed
         self.build_timer = self._BUILD_TIME   # counts down once a job is queued
         self.build_queue: list = []           # ship-type strings waiting to be built
         self.time = 0.0
-        self.smoke_timer = 0.0
-        self.smoke = []  # list of [dx, dy, vy, life, max_life, size]
         radius = 65
         color = self._COLORS[team]
-        super().__init__(home_planet.star_x + math.cos(angle) * orbit_radius - radius,
-                         home_planet.star_y + math.sin(angle) * orbit_radius - radius,
+        planet_cx = home_planet.wx + home_planet.radius
+        planet_cy = home_planet.wy + home_planet.radius
+        super().__init__(planet_cx - radius, planet_cy - radius,
                          radius * 2, radius * 2, color)
         self.radius = radius
-        self.face_angle = angle - math.pi * 0.5
+        self.face_angle = -math.pi * 0.5
         self._col_dark   = tuple(max(0, c - 90) for c in color)
         self._col_mid    = tuple(max(0, c - 45) for c in color)
         self._col_bright = tuple(min(255, c + 60) for c in color)
@@ -168,34 +168,11 @@ class Constructor(Entity):
         return max(0.0, min(1.0, 1.0 - self.build_timer / self._BUILD_TIME))
 
     def update(self, dt: float):
-        self.angle = (self.angle + self.orbit_speed * dt) % math.tau
-        self.wx = self.home_planet.star_x + math.cos(self.angle) * self.orbit_radius - self.radius
-        self.wy = self.home_planet.star_y + math.sin(self.angle) * self.orbit_radius - self.radius
+        planet_cx = self.home_planet.wx + self.home_planet.radius
+        planet_cy = self.home_planet.wy + self.home_planet.radius
+        self.wx = planet_cx - self.radius
+        self.wy = planet_cy - self.radius
         self.time += dt
-        # Local -Y axis (chimney side) points toward the star.
-        self.face_angle = self.angle - math.pi * 0.5
-
-        self.smoke_timer -= dt
-        progress = self._build_progress()
-        spawn_rate = 0.35 - 0.25 * progress
-        if self.smoke_timer <= 0.0:
-            self.smoke_timer = spawn_rate
-            frac = random.choice(self._CHIMNEY_FRACS)
-            chimney_dx = frac * self.radius * 4 + random.uniform(-4, 4)
-            chimney_top = -(self.radius + self.radius * 0.85)
-            self.smoke.append([
-                chimney_dx,
-                chimney_top,
-                -random.uniform(18, 32),
-                0.0,
-                random.uniform(1.4, 2.2),
-                random.uniform(5, 10),
-            ])
-        for puff in self.smoke:
-            puff[3] += dt
-            puff[1] += puff[2] * dt
-            puff[0] += math.sin(self.time * 1.8 + puff[1] * 0.05) * 8 * dt
-        self.smoke = [p for p in self.smoke if p[3] < p[4]]
 
         if self.build_queue:
             self.build_timer -= dt
@@ -210,135 +187,136 @@ class Constructor(Entity):
             self.build_timer = self._BUILD_TIME   # reset so next job starts promptly
         return None
 
-    @staticmethod
-    def _poly_points(cx, cy, r, sides, rotation=0.0):
-        return [
-            (cx + math.cos(rotation + i * math.tau / sides) * r,
-             cy + math.sin(rotation + i * math.tau / sides) * r)
-            for i in range(sides)
-        ]
-
     def draw(self, surface: pygame.Surface, camera) -> None:
         if not camera.is_visible_xywh(self.wx, self.wy, self.width, self.height):
             return
         cx, cy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
-        r = max(2, int(self.radius * camera.zoom))
-        zoom = camera.zoom
+        zoom     = camera.zoom
+        R        = max(6, int(self.radius * 1.8 * zoom))   # visual outer radius
+        hub      = max(3, int(R * 0.28))                   # central hub radius
+        mid_ring = int(R * 0.62)                           # rotating machinery band
         progress = self._build_progress()
+        building = bool(self.build_queue)
 
         col    = self.color
         dark   = self._col_dark
         mid    = self._col_mid
         bright = self._col_bright
 
-        # Factory physical dimensions in screen pixels
-        W = r * 4   # half-width  (along factory length)
-        H = r       # half-height (perpendicular; chimneys at -H, girder at +H)
+        ring_rot  = self.time * 0.10          # slow outer-ring rotation
+        inner_rot = self.time * 1.6 * (1.0 + progress * 0.8)  # assembly arms
 
-        # Rotation helpers — local (dx, dy) → screen (px, py).
-        # face_angle keeps the chimney side (-Y) always aimed at the star.
-        cos_f = math.cos(self.face_angle)
-        sin_f = math.sin(self.face_angle)
+        N  = 8
+        lw = max(1, int(zoom * 1.1))
 
-        def rot(dx, dy):
-            return (int(cx + dx * cos_f - dy * sin_f),
-                    int(cy + dx * sin_f + dy * cos_f))
+        # ── Production glow ───────────────────────────────────────────────────
+        if building:
+            gp = 0.3 + 0.2 * math.sin(self.time * 4.0) + 0.25 * progress
+            for step in range(3, 0, -1):
+                frac = step / 3.0
+                gc   = tuple(min(255, int(c * frac * gp * 0.55)) for c in bright)
+                pygame.draw.circle(surface, gc, (cx, cy),
+                                   R + int(10 * frac * zoom))
 
-        lw = max(1, int(zoom))
+        # ── Sector plates (body of the building) ──────────────────────────────
+        for i in range(N):
+            a1 = i       * math.tau / N
+            a2 = (i + 1) * math.tau / N
+            plate_col = dark if i % 2 == 0 else tuple(max(0, c - 25) for c in mid)
+            pts = [(cx, cy)]
+            for s in range(7):
+                a = a1 + (a2 - a1) * s / 6.0
+                pts.append((int(cx + math.cos(a) * (R - max(1, int(2 * zoom)))),
+                            int(cy + math.sin(a) * (R - max(1, int(2 * zoom))))))
+            pygame.draw.polygon(surface, plate_col, pts)
 
-        # ── Smoke plumes — rotated into world orientation ─────────────────────
-        for dx, dy, _vy, life, max_life, size in self.smoke:
-            fade = max(0.0, 1.0 - life / max_life)
-            if fade <= 0.0:
-                continue
-            px, py = rot(dx * zoom, dy * zoom)
-            psize = max(1, int(size * zoom * (1.0 + life * 0.6)))
-            shade = int((110 + 70 * fade) * fade)
-            pygame.draw.circle(surface, (shade, shade, shade), (px, py), psize)
+        # ── Radial structural spokes ──────────────────────────────────────────
+        for i in range(N):
+            a = i * math.tau / N
+            pygame.draw.line(surface, mid,
+                             (int(cx + math.cos(a) * hub),
+                              int(cy + math.sin(a) * hub)),
+                             (int(cx + math.cos(a) * R),
+                              int(cy + math.sin(a) * R)), lw)
 
-        # ── Main hull (rotated polygon) ───────────────────────────────────────
-        hull_pts = [rot(-W, -H), rot(W, -H), rot(W, H), rot(-W, H)]
-        pygame.draw.polygon(surface, dark, hull_pts)
-        pygame.draw.polygon(surface, col, hull_pts, max(1, int(2 * zoom)))
-
-        # ── Bay dividers ──────────────────────────────────────────────────────
-        n_bays = 5
-        for i in range(1, n_bays):
-            dx_div = -W + i * (2 * W // n_bays)
-            pygame.draw.line(surface, mid, rot(dx_div, -H), rot(dx_div, H), lw)
-
-        # ── Central assembly bay ──────────────────────────────────────────────
-        bw = int(W * 0.48)
-        bh = int(H * 0.65)
-        bay_pts = [rot(-bw, -bh), rot(bw, -bh), rot(bw, bh), rot(-bw, bh)]
-        pygame.draw.polygon(surface, mid, bay_pts)
-        pygame.draw.polygon(surface, bright, bay_pts, lw)
-
-        # Rotating assembly arm in local factory space
-        arm_r = max(2, min(bw, bh) - max(1, int(3 * zoom)))
-        arm_a = self.time * 1.4 * (1.0 + progress * 0.6)
-        cos_a = math.cos(arm_a) * arm_r
-        sin_a = math.sin(arm_a) * arm_r
-        pygame.draw.line(surface, bright, (cx, cy), rot(int(cos_a),  int(sin_a)),  max(1, int(2 * zoom)))
-        pygame.draw.line(surface, bright, (cx, cy), rot(int(-cos_a), int(-sin_a)), max(1, int(2 * zoom)))
-
-        # ── Back girder rail (away from sun) ──────────────────────────────────
-        rail_off = H + max(1, int(3 * zoom))
-        pygame.draw.line(surface, bright, rot(-W, rail_off), rot(W, rail_off),
-                         max(1, int(2 * zoom)))
-        brace_drop = max(2, int(7 * zoom))
-        for i in range(4):
-            dx1 = -W + i * (2 * W // 4)
-            dx2 = -W + (i + 1) * (2 * W // 4)
-            dxm = (dx1 + dx2) // 2
-            pygame.draw.line(surface, mid, rot(dx1, rail_off), rot(dxm, rail_off + brace_drop), lw)
-            pygame.draw.line(surface, mid, rot(dx2, rail_off), rot(dxm, rail_off + brace_drop), lw)
-
-        # ── Five chimney stacks (point toward the star) ───────────────────────
-        stack_h = int(H * 0.85)
-        stack_w = max(2, int(r * 0.22))
-        stack_tops = []
-        for i, frac in enumerate(self._CHIMNEY_FRACS):
-            dx_s = int(frac * W)
-            base = rot(dx_s, -H)
-            top  = rot(dx_s, -H - stack_h)
-            stack_tops.append(top)
-            pygame.draw.line(surface, dark,  base, top, stack_w + 1)
-            pygame.draw.line(surface, mid,   base, top, max(1, stack_w - 1))
+        # ── Rotating mid-ring (gear/conveyor band) ────────────────────────────
+        pygame.draw.circle(surface, mid, (cx, cy), mid_ring,
+                           max(2, int(2.5 * zoom)))
+        tick_len = max(2, int(4 * zoom))
+        for i in range(16):
+            a  = ring_rot + i * math.tau / 16
+            r1 = mid_ring - tick_len
+            r2 = mid_ring + tick_len
             pygame.draw.line(surface, bright,
-                             rot(dx_s - stack_w, -H - stack_h),
-                             rot(dx_s + stack_w, -H - stack_h),
-                             lw)
+                             (int(cx + math.cos(a) * r1), int(cy + math.sin(a) * r1)),
+                             (int(cx + math.cos(a) * r2), int(cy + math.sin(a) * r2)),
+                             max(1, int(zoom)))
 
-        # ── Side radiator fins ─────────────────────────────────────────────────
-        fin_len = int(H * 0.75)
-        for side in (-1, 1):
-            for fi in range(3):
-                fy = -H // 2 + fi * H // 2
-                pygame.draw.line(surface, mid,
-                                 rot(side * W, fy),
-                                 rot(side * (W + fin_len), fy), lw)
+        # ── Outer structural ring ─────────────────────────────────────────────
+        pygame.draw.circle(surface, col, (cx, cy), R, max(2, int(3 * zoom)))
+        pygame.draw.circle(surface, bright, (cx, cy), R + 1, max(1, int(zoom)))
 
-        # ── Corner warning lights ──────────────────────────────────────────────
-        for i, (dx_c, dy_c) in enumerate([(-W, -H), (W, -H), (-W, H), (W, H)]):
-            b = 0.5 + 0.5 * math.sin(self.time * 3.0 + i * 1.5)
-            pygame.draw.circle(surface, (255, int(80 + 100 * b), 0),
-                               rot(dx_c, dy_c), max(1, int(2 * zoom)))
+        # ── Perimeter station modules (at sector midpoints) ───────────────────
+        mod_r = max(2, int(3.5 * zoom))
+        for i in range(N):
+            a  = (i + 0.5) * math.tau / N
+            mx = int(cx + math.cos(a) * R)
+            my = int(cy + math.sin(a) * R)
+            pp = 0.5 + 0.5 * math.sin(self.time * 3.5 + i * 0.78)
+            mc = tuple(min(255, int(c * pp)) for c in bright) \
+                 if (building and i % 2 == 0) else mid
+            pygame.draw.circle(surface, dark, (mx, my), mod_r + 1)
+            pygame.draw.circle(surface, mc,   (mx, my), mod_r)
 
-        # Stack-top hazard lights
-        for i, pt in enumerate(stack_tops):
-            b = 0.5 + 0.5 * math.sin(self.time * 4.5 + i * 0.9)
-            if b > 0.55:
-                pygame.draw.circle(surface, (255, 60, 0), pt, max(1, int(2 * zoom)))
+        # ── Central hub ───────────────────────────────────────────────────────
+        pygame.draw.circle(surface, dark, (cx, cy), hub)
+        pygame.draw.circle(surface, mid,  (cx, cy), hub, max(1, int(1.5 * zoom)))
 
-        # ── Build progress bar (behind the factory, rotated) ──────────────────
+        # ── Assembly arms (production animation — always rotate when building) ─
+        arm_r = max(1, hub - max(1, int(3 * zoom)))
+        alw   = max(1, int(2 * zoom))
+        cos_i = math.cos(inner_rot)
+        sin_i = math.sin(inner_rot)
+        pygame.draw.line(surface, bright,
+                         (cx, cy),
+                         (int(cx + cos_i * arm_r), int(cy + sin_i * arm_r)), alw)
+        pygame.draw.line(surface, mid,
+                         (cx, cy),
+                         (int(cx - cos_i * arm_r), int(cy - sin_i * arm_r)),
+                         max(1, alw - 1))
+        c2 = math.cos(inner_rot + math.pi / 2)
+        s2 = math.sin(inner_rot + math.pi / 2)
+        cr = int(arm_r * 0.55)
+        pygame.draw.line(surface, mid,
+                         (int(cx + c2 * cr), int(cy + s2 * cr)),
+                         (int(cx - c2 * cr), int(cy - s2 * cr)),
+                         max(1, int(zoom)))
+
+        # Core dot
+        core_r = max(2, int(3 * zoom))
+        if building:
+            cp       = 0.55 + 0.45 * math.sin(self.time * 7.0)
+            core_col = tuple(min(255, int(c * cp)) for c in bright)
+        else:
+            core_col = mid
+        pygame.draw.circle(surface, core_col, (cx, cy), core_r)
+
+        # ── Build progress arc (sweeps clockwise from 12 o'clock) ────────────
         if progress > 0.0:
-            bar_off = rail_off + max(2, int(4 * zoom))
-            bar_h_px = max(1, int(3 * zoom))
-            bar_end = -W + int(2 * W * progress)
-            bar_pts = [rot(-W, bar_off), rot(bar_end, bar_off),
-                       rot(bar_end, bar_off + bar_h_px), rot(-W, bar_off + bar_h_px)]
-            pygame.draw.polygon(surface, (255, 220, 60), bar_pts)
+            arc_r   = R + max(3, int(5 * zoom))
+            arc_lw  = max(2, int(3 * zoom))
+            a_start = -math.pi / 2
+            a_end   = a_start + math.tau * progress
+            arc_col = (int(80 + 175 * progress), int(220 - 60 * progress), 40)
+            n_seg   = max(4, int(36 * progress))
+            prev_pt = None
+            for s in range(n_seg + 1):
+                a  = a_start + (a_end - a_start) * s / n_seg
+                pt = (int(cx + math.cos(a) * arc_r),
+                      int(cy + math.sin(a) * arc_r))
+                if prev_pt:
+                    pygame.draw.line(surface, arc_col, prev_pt, pt, arc_lw)
+                prev_pt = pt
 
 
 
@@ -581,6 +559,8 @@ class MinerShip(Entity):
         self._needs_defense = False  # set True by active escort orders; cleared each frame
         self._asteroid_mode = False  # True while assigned to an asteroid; auto-reassigns on depletion
         self.asteroids      = []     # shared list reference; set from main.py after construction
+        self._sep_ax        = 0.0
+        self._sep_ay        = 0.0
 
     def send_to(self, planet) -> None:
         """Order this miner to fly to and land on planet/asteroid."""
@@ -593,6 +573,16 @@ class MinerShip(Entity):
         if not self.alive:
             return
         self.time += dt
+
+        if self.state not in ('idle', 'landed'):
+            _sm = math.hypot(self._sep_ax, self._sep_ay)
+            if _sm > 200.0:
+                self._sep_ax *= 200.0 / _sm
+                self._sep_ay *= 200.0 / _sm
+            self.wx += self._sep_ax * dt
+            self.wy += self._sep_ay * dt
+        self._sep_ax = 0.0
+        self._sep_ay = 0.0
 
         if self.state == 'idle':
             return
@@ -612,7 +602,8 @@ class MinerShip(Entity):
                     ptype = getattr(self._landed_planet, 'planet_type', None)
                     if hasattr(self._landed_planet, 'resources'):
                         # Finite asteroid: split total mined proportionally across yields
-                        yields     = self._ASTEROID_YIELDS.get(ptype, {})
+                        yields     = getattr(self._landed_planet, 'yields',
+                                             self._ASTEROID_YIELDS.get(ptype, {}))
                         total_rate = sum(yields.values()) or 1.0
                         mined      = min(total_rate * dt, self._landed_planet.resources)
                         self._landed_planet.resources -= mined
@@ -636,7 +627,8 @@ class MinerShip(Entity):
                             self.cargo_hold[mat] += mined * (rate / total_rate)
                     else:
                         # Infinite planet: add all yields for this planet type
-                        for mat, rate in self._PLANET_YIELDS.get(ptype, {}).items():
+                        for mat, rate in getattr(self._landed_planet, 'yields',
+                                                 self._PLANET_YIELDS.get(ptype, {})).items():
                             self.cargo_hold[mat] += rate * dt
             return
 
@@ -848,6 +840,8 @@ class CargoShip(Entity):
         self.hp                   = 80
         self._needs_defense       = False
         self._assigned_miners     = None  # None = auto-seek any miner; list = restricted pool
+        self._sep_ax              = 0.0
+        self._sep_ay              = 0.0
 
     def update(self, dt: float) -> None:
         if not self.alive:
@@ -855,6 +849,15 @@ class CargoShip(Entity):
         self.time             += dt
         self._beam_active      = False
         self._unload_beam_active = False
+
+        _sm = math.hypot(self._sep_ax, self._sep_ay)
+        if _sm > 200.0:
+            self._sep_ax *= 200.0 / _sm
+            self._sep_ay *= 200.0 / _sm
+        self.wx += self._sep_ax * dt
+        self.wy += self._sep_ay * dt
+        self._sep_ax = 0.0
+        self._sep_ay = 0.0
 
         if self.state == 'seeking':
             # Prune dead miners from the assigned list; fall back to auto if all gone
@@ -904,9 +907,11 @@ class CargoShip(Entity):
                     miner_hold[mat]        -= xfer
                     self.cargo_hold[mat]   += xfer
             self._beam_active = True
-            miner_empty = all(v < 0.5 for v in miner_hold.values())
-            iron_full   = self.cargo_hold.get('iron', 0) >= self.CARGO_CAPS['iron']
-            if iron_full or miner_empty:
+            can_transfer = any(
+                miner_hold.get(mat, 0.0) > 0.5 and self.cargo_hold.get(mat, 0.0) < cap
+                for mat, cap in self.CARGO_CAPS.items()
+            )
+            if not can_transfer:
                 self._beam_active  = False
                 self._target_miner = None
                 self.state         = 'to_constructor'
@@ -973,14 +978,16 @@ class CargoShip(Entity):
                              (bsx, bsy), (esx, esy), lw)
             pygame.draw.line(surface, (255, 230, 80),
                              (bsx, bsy), (esx, esy), max(1, lw - 1))
-            # Pulsing glow at the constructor end
-            r_glow = max(4, int(16 * pulse * camera.zoom))
-            for step in range(4, 0, -1):
-                frac = step / 4
-                gc = (int(255 * frac * pulse),
-                      int(180 * frac * pulse),
-                      int(20  * frac * pulse))
-                pygame.draw.circle(surface, gc, (esx, esy), int(r_glow * frac))
+            # Crates traveling along the unload beam (ship → constructor)
+            _cs = max(3, int(4 * camera.zoom))
+            for _ci in range(3):
+                _t   = ((self.time * 0.9 + _ci / 3.0) % 1.0)
+                _cpx = int(bsx + (esx - bsx) * _t)
+                _cpy = int(bsy + (esy - bsy) * _t)
+                pygame.draw.rect(surface, (160, 110, 38),
+                                 (_cpx - _cs, _cpy - _cs, _cs * 2, _cs * 2))
+                pygame.draw.rect(surface, (210, 160, 75),
+                                 (_cpx - _cs, _cpy - _cs, _cs * 2, _cs * 2), 1)
 
         # Load beam: miner → cargo ship (green, drawn before vis check)
         if self._beam_active and self._target_miner is not None:
@@ -1002,6 +1009,16 @@ class CargoShip(Entity):
                              (bsx, bsy), (esx, esy), lw)
             pygame.draw.line(surface, (210, 255, 210),
                              (bsx, bsy), (esx, esy), max(1, lw - 1))
+            # Crates traveling along the loading beam (miner → ship)
+            _cs = max(3, int(4 * camera.zoom))
+            for _ci in range(3):
+                _t   = ((self.time * 1.1 + _ci / 3.0) % 1.0)
+                _cpx = int(bsx + (esx - bsx) * _t)
+                _cpy = int(bsy + (esy - bsy) * _t)
+                pygame.draw.rect(surface, (60, 150, 70),
+                                 (_cpx - _cs, _cpy - _cs, _cs * 2, _cs * 2))
+                pygame.draw.rect(surface, (140, 220, 140),
+                                 (_cpx - _cs, _cpy - _cs, _cs * 2, _cs * 2), 1)
 
         if not camera.is_visible(self.world_rect):
             return
@@ -1105,6 +1122,38 @@ class CargoShip(Entity):
                     ]
                     pygame.draw.polygon(surface, crate_col, pts)
                     pygame.draw.polygon(surface, rim_c, pts, border_w)
+
+        # ── Stacked crates on hull top (grows with fill) ─────────────────
+        _total_held = sum(self.cargo_hold.values())
+        _total_cap  = sum(self.CARGO_CAPS.values())
+        _total_fill = min(_total_held / max(1.0, _total_cap), 1.0)
+        _n_stack    = int(_total_fill * 5)  # 0–5 crates
+
+        if _n_stack > 0:
+            _cw  = max(4, int(L * 0.36))
+            _ch  = max(3, int(_cw * 0.62))
+            _gap = max(1, int(camera.zoom))
+            _crate_base_cols = [
+                (130,  88, 38), (118,  78, 32), (142,  98, 44),
+                (122,  82, 36), (135,  92, 41),
+            ]
+            for _i in range(_n_stack):
+                _ly  = -(W * 1.05 + _gap + _i * (_ch * 2 + _gap) + _ch)
+                _cc  = _crate_base_cols[_i % len(_crate_base_cols)]
+                _rc  = tuple(min(255, c + 48) for c in _cc)
+                _cpts = [
+                    ts(-_cw, _ly - _ch),
+                    ts( _cw, _ly - _ch),
+                    ts( _cw, _ly + _ch),
+                    ts(-_cw, _ly + _ch),
+                ]
+                pygame.draw.polygon(surface, _cc, _cpts)
+                pygame.draw.polygon(surface, _rc, _cpts,
+                                    max(1, int(camera.zoom * 0.8)))
+                # Binding strap across the middle
+                pygame.draw.line(surface, _rc,
+                                 ts(-_cw * 0.85, _ly), ts(_cw * 0.85, _ly),
+                                 max(1, int(camera.zoom * 0.7)))
 
         # Engine glow at stern
         eng_px = int(cx - cos_a * L)
@@ -1213,9 +1262,9 @@ class GlowingAsteroid:
     team        = None            # neutral — any miner can target it
 
     def __init__(self, wx: float, wy: float):
-        self.wx     = wx
-        self.wy     = wy
         self.radius = random.randint(55, 120)
+        self.wx     = wx - self.radius   # store top-left so wx+radius == center
+        self.wy     = wy - self.radius
         self.width  = self.radius * 2
         self.height = self.radius * 2
         self.angle  = random.uniform(0.0, math.tau)
@@ -1234,6 +1283,9 @@ class GlowingAsteroid:
         self.glow_color  = random.choice(self._GLOW_PALETTE)
         self._rock_color = (168, 162, 155)
         self._rock_rim   = (210, 205, 200)
+        _n = random.randint(2, 3)
+        _chosen = random.sample(_ALL_MATERIALS, _n)
+        self.yields = {m: round(random.uniform(10.0, 20.0), 1) for m in _chosen}
 
     def update(self, dt: float) -> None:
         self.time += dt
@@ -1245,7 +1297,7 @@ class GlowingAsteroid:
         if not camera.is_visible_xywh(self.wx - pad, self.wy - pad, pad * 2, pad * 2):
             return
 
-        sx, sy = camera.world_to_screen(self.wx, self.wy)
+        sx, sy = camera.world_to_screen(self.wx + self.radius, self.wy + self.radius)
         zoom   = camera.zoom
         res_frac = max(0.0, self.resources / self.max_resources)
         pulse  = (0.5 + 0.5 * math.sin(self.time * 1.6)) * res_frac
@@ -1328,6 +1380,9 @@ class MineableAsteroid:
 
         self._col_fill = (138, 132, 124)
         self._col_rim  = (195, 190, 185)
+        _n = random.randint(2, 3)
+        _chosen = random.sample(_ALL_MATERIALS, _n)
+        self.yields = {m: round(random.uniform(8.0, 15.0), 1) for m in _chosen}
 
     def update(self, dt: float) -> None:
         pass
@@ -1803,18 +1858,6 @@ class AICharacter(Entity):
 
         cx = self.wx + self.width  / 2
         cy = self.wy + self.height / 2
-
-        # ── Separation: push away from nearby allies ──────────────────────
-        for ship in all_ships:
-            if ship is self or ship.team != self.team or not ship.alive:
-                continue
-            ox = ship.wx + ship.width  / 2
-            oy = ship.wy + ship.height / 2
-            d  = math.hypot(ox - cx, oy - cy)
-            if 0 < d < SEPARATION_DIST:
-                strength = (SEPARATION_DIST - d) / SEPARATION_DIST * SEPARATION_FORCE
-                self._sep_ax += (cx - ox) / d * strength
-                self._sep_ay += (cy - oy) / d * strength
 
         # ── Retreat: break off when critically damaged ────────────────────
         # Adaptive aggression: a team that's winning presses the advantage
@@ -2611,18 +2654,6 @@ class Carrier(AICharacter):
 
         cx = self.wx + self.width  / 2
         cy = self.wy + self.height / 2
-
-        # Separation — carriers need more personal space than frigates
-        for ship in all_ships:
-            if ship is self or ship.team != self.team or not ship.alive:
-                continue
-            ox = ship.wx + ship.width  / 2
-            oy = ship.wy + ship.height / 2
-            d  = math.hypot(ox - cx, oy - cy)
-            if 0 < d < SEPARATION_DIST * 1.6:
-                strength = (SEPARATION_DIST * 1.6 - d) / (SEPARATION_DIST * 1.6) * SEPARATION_FORCE
-                self._sep_ax += (cx - ox) / d * strength
-                self._sep_ay += (cy - oy) / d * strength
 
         # Find nearest enemy (used for movement and deployment decisions)
         nearest_enemy = None
