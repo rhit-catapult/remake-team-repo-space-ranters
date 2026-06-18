@@ -1121,35 +1121,97 @@ def _draw_quit_confirm(screen, elapsed, mouse_pos):
 def _draw_game_end(screen, victory: bool, player_team: int, elapsed: float):
     """Display game end screen (victory or defeat overlay)."""
     sw, sh = screen.get_size()
+
+    # Tinted full-screen overlay
     overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 200))
+    if victory:
+        team_col = TEAM_COLORS[player_team]
+        overlay.fill((team_col[0] // 6, team_col[1] // 6, team_col[2] // 6, 210))
+    else:
+        overlay.fill((40, 0, 0, 210))
     screen.blit(overlay, (0, 0))
 
-    font_title = pygame.font.SysFont("impact", 72)
+    font_title = pygame.font.SysFont("impact", 96)
+    font_team  = pygame.font.SysFont("impact", 38)
     font_sub   = pygame.font.SysFont("monospace", 18)
-    font_hint  = pygame.font.SysFont("monospace", 14)
+    font_hint  = pygame.font.SysFont("monospace", 15)
+
+    pulse       = 0.55 + 0.45 * math.sin(elapsed * 2.8)
+    slow_pulse  = 0.7  + 0.3  * math.sin(elapsed * 1.2)
 
     if victory:
         title_text = "VICTORY!"
-        title_col = TEAM_COLORS[player_team]
-        sub_text = "Enemy command center destroyed!"
+        base_col   = TEAM_COLORS[player_team]
+        team_text  = f"{TEAM_NAMES[player_team]} WINS"
+        sub_text   = "Enemy command center destroyed!"
     else:
         title_text = "DEFEAT"
-        title_col = (220, 80, 80)
-        sub_text = "Your command center was destroyed."
+        base_col   = (220, 50, 50)
+        enemy_team = 1 - player_team
+        team_text  = f"{TEAM_NAMES[enemy_team]} WINS"
+        sub_text   = "Your command center was destroyed."
 
-    # Pulsing title
-    pulse = 0.6 + 0.4 * math.sin(elapsed * 3.0)
-    title_col = tuple(min(255, int(c * pulse)) for c in title_col)
-    
-    title = font_title.render(title_text, True, title_col)
-    screen.blit(title, title.get_rect(center=(sw // 2, sh // 2 - 80)))
+    # Glow shadow layer
+    glow_col = tuple(min(255, int(c * 0.35)) for c in base_col)
+    title_col = tuple(min(255, int(c * pulse)) for c in base_col)
 
-    sub = font_sub.render(sub_text, True, (200, 200, 200))
-    screen.blit(sub, sub.get_rect(center=(sw // 2, sh // 2 + 20)))
+    cx = sw // 2
+    title_y = sh // 2 - 120
 
-    hint = font_hint.render("Close window or press Esc to exit", True, (140, 140, 160))
-    screen.blit(hint, hint.get_rect(center=(sw // 2, sh // 2 + 120)))
+    for off in ((3, 3), (-3, 3), (3, -3), (-3, -3)):
+        s = font_title.render(title_text, True, glow_col)
+        screen.blit(s, s.get_rect(center=(cx + off[0], title_y + off[1])))
+
+    title_surf = font_title.render(title_text, True, title_col)
+    screen.blit(title_surf, title_surf.get_rect(center=(cx, title_y)))
+
+    # Team name
+    team_col = tuple(min(255, int(c * slow_pulse)) for c in base_col)
+    team_surf = font_team.render(team_text, True, team_col)
+    screen.blit(team_surf, team_surf.get_rect(center=(cx, sh // 2 - 20)))
+
+    # Decorative separator line
+    line_w = 380
+    line_col = tuple(min(255, int(c * 0.6)) for c in base_col)
+    pygame.draw.line(screen, line_col,
+                     (cx - line_w // 2, sh // 2 + 18),
+                     (cx + line_w // 2, sh // 2 + 18), 2)
+
+    # Subtitle
+    sub_surf = font_sub.render(sub_text, True, (210, 210, 210))
+    screen.blit(sub_surf, sub_surf.get_rect(center=(cx, sh // 2 + 42)))
+
+    # Hints
+    hint_col = (150, 150, 170)
+    enter_surf = font_hint.render("ENTER — Return to Menu", True, hint_col)
+    esc_surf   = font_hint.render("ESC — Quit", True, hint_col)
+    screen.blit(enter_surf, enter_surf.get_rect(center=(cx, sh // 2 + 110)))
+    screen.blit(esc_surf,   esc_surf.get_rect(center=(cx, sh // 2 + 132)))
+
+
+def _spawn_base_explosion(cx: float, cy: float, radius: float,
+                           explosions: list) -> None:
+    """Cascade of explosions covering the full base footprint."""
+    # Central mega-blast
+    explosions.append(Explosion(cx, cy, int(radius * 5), int(radius * 5)))
+    # Inner ring — 8 blasts close to center
+    for i in range(8):
+        angle = i * math.tau / 8 + random.uniform(-0.2, 0.2)
+        dist  = radius * random.uniform(0.4, 0.85)
+        explosions.append(Explosion(
+            cx + math.cos(angle) * dist,
+            cy + math.sin(angle) * dist,
+            int(radius * 2.8), int(radius * 2.8),
+        ))
+    # Outer ring — 12 smaller blasts
+    for i in range(12):
+        angle = i * math.tau / 12 + random.uniform(-0.25, 0.25)
+        dist  = radius * random.uniform(0.9, 1.7)
+        explosions.append(Explosion(
+            cx + math.cos(angle) * dist,
+            cy + math.sin(angle) * dist,
+            int(radius * 1.6), int(radius * 1.6),
+        ))
 
 
 # ── Resource / build helpers ──────────────────────────────────────────────────
@@ -1630,16 +1692,22 @@ def main():
             continue
 
         # ── Events ────────────────────────────────────────────────────────────
-        # If game is over, only allow quit/escape
+        # If game is over, show end screen; ENTER → menu, ESC/close → quit
         if game_over:
+            _return_to_menu = False
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        pygame.quit(); sys.exit()
+                    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        _return_to_menu = True
             render_frame()
             _draw_game_end(screen, victory, player_team, elapsed)
             pygame.display.flip()
+            if _return_to_menu:
+                return  # caller loops main() back to menu
             continue
 
         for event in pygame.event.get():
@@ -2356,19 +2424,19 @@ def main():
             if player_cc and not player_cc.alive:
                 game_over = True
                 victory = False
-                explosions.append(Explosion(
+                _spawn_base_explosion(
                     player_cc.wx + player_cc.radius,
                     player_cc.wy + player_cc.radius,
-                    player_cc.width, player_cc.height,
-                ))
+                    player_cc.radius, explosions,
+                )
             elif enemy_cc and not enemy_cc.alive:
                 game_over = True
                 victory = True
-                explosions.append(Explosion(
+                _spawn_base_explosion(
                     enemy_cc.wx + enemy_cc.radius,
                     enemy_cc.wy + enemy_cc.radius,
-                    enemy_cc.width, enemy_cc.height,
-                ))
+                    enemy_cc.radius, explosions,
+                )
 
         # ── Draw ──────────────────────────────────────────────────────────────
         render_frame()
@@ -2376,4 +2444,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        main()

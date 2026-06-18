@@ -53,6 +53,8 @@ class CommandCenter:
         # Position (updated in update())
         self.wx = 0.0
         self.wy = 0.0
+        self.vx = 0.0
+        self.vy = 0.0
         self._update_position()
 
     def _update_position(self):
