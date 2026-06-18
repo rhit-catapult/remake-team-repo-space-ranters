@@ -167,13 +167,19 @@ class CommandCenter:
                                (cx + int(r * 0.28), cy - int(r * 0.28)),
                                max(2, int(r * 0.08)))
 
-        # ── Health bar when damaged ───────────────────────────────────────────
-        if self.hp < self.max_hp:
-            bar_w = r * 2
-            bar_h = max(2, int(3 * zoom))
-            bar_x = cx - bar_w // 2
-            bar_y = cy - r - 12
-            pygame.draw.rect(surface, (120, 0, 0), (bar_x, bar_y, bar_w, bar_h))
-            fill_w = int(bar_w * self.hp / self.max_hp)
-            pygame.draw.rect(surface, (0, 210, 60), (bar_x, bar_y, fill_w, bar_h))
-            pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
+        # ── Health bar (always visible) ───────────────────────────────────────
+        bar_w = r * 2 + max(0, int(8 * zoom))
+        bar_h = max(5, int(8 * zoom))
+        bar_x = cx - bar_w // 2
+        bar_y = cy - r - max(14, int(18 * zoom))
+        pygame.draw.rect(surface, (80, 0, 0), (bar_x, bar_y, bar_w, bar_h))
+        fill_w = max(0, int(bar_w * self.hp / self.max_hp))
+        hp_frac = self.hp / self.max_hp
+        if hp_frac > 0.5:
+            bar_color = (0, 210, 60)
+        elif hp_frac > 0.25:
+            bar_color = (220, 180, 0)
+        else:
+            bar_color = (220, 40, 40)
+        pygame.draw.rect(surface, bar_color, (bar_x, bar_y, fill_w, bar_h))
+        pygame.draw.rect(surface, (220, 220, 220), (bar_x, bar_y, bar_w, bar_h), max(1, int(zoom)))

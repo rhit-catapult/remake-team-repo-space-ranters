@@ -1257,19 +1257,6 @@ class CargoShip(Entity):
         pygame.draw.circle(surface, (0, 0, 0), (ix, iy), 4)
         pygame.draw.circle(surface, dot_col,   (ix, iy), 3)
 
-        # Purple hull aura when carrying crystal
-        _crystal_held = self.cargo_hold.get('crystal', 0)
-        if _crystal_held > 0.5:
-            s_fill  = min(_crystal_held / self.CARGO_CAPS.get('crystal', 50), 1.0)
-            sp      = (0.65 + 0.35 * math.sin(self.time * 7.0)) if active else 0.8
-            r_aura  = max(5, int(math.hypot(L, W) * 1.15))
-            for step in range(3, 0, -1):
-                frac = step / 3
-                gc = (int(120 * frac * s_fill * sp),
-                      int(30  * frac * s_fill * sp),
-                      int(180 * frac * s_fill * sp))
-                pygame.draw.circle(surface, gc, (cx, cy), int(r_aura * frac))
-
         # ── Cargo bars above the ship ─────────────────────────────────────
         _total_held = sum(self.cargo_hold.values())
         if _total_held > 0.1:
@@ -1284,14 +1271,6 @@ class CargoShip(Entity):
             pygame.draw.rect(surface, (25, 25, 25),   (bx, by, bar_w, 5))
             pygame.draw.rect(surface, bc,              (bx, by, fill_w, 5))
             pygame.draw.rect(surface, (140, 140, 140), (bx, by, bar_w, 5), 1)
-            # Secondary bar: crystal (purple) if present
-            if _crystal_held > 0.5:
-                s_f    = min(_crystal_held / self.CARGO_CAPS.get('crystal', 50), 1.0)
-                s_fill = max(1, int(bar_w * s_f))
-                sy_bar = by + 7
-                pygame.draw.rect(surface, (20,  10,  35),  (bx, sy_bar, bar_w, 5))
-                pygame.draw.rect(surface, (180,  80, 255), (bx, sy_bar, s_fill, 5))
-                pygame.draw.rect(surface, (140, 100, 200), (bx, sy_bar, bar_w, 5), 1)
 
         # Hull health bar (shown when damaged)
         if self.hp < self.max_hp:
@@ -1895,9 +1874,9 @@ class AICharacter(Entity):
 
         # Apply separation impulse — cap so clustered ships can't spike huge combined forces
         sep_mag = math.hypot(self._sep_ax, self._sep_ay)
-        if sep_mag > 120.0:
-            self._sep_ax *= 120.0 / sep_mag
-            self._sep_ay *= 120.0 / sep_mag
+        if sep_mag > 280.0:
+            self._sep_ax *= 280.0 / sep_mag
+            self._sep_ay *= 280.0 / sep_mag
         self.vx += self._sep_ax * dt
         self.vy += self._sep_ay * dt
         self._sep_ax = 0.0
@@ -2070,9 +2049,19 @@ class AICharacter(Entity):
         ex = target.wx + target.width  / 2
         ey = target.wy + target.height / 2
         d  = math.hypot(ex - cx, ey - cy)
-        # Lead time: how long it takes us to close at max speed (scaled to converge, not overshoot)
         t  = d / max(1.0, self.max_speed) * 0.55
-        return (ex + target.vx * t, ey + target.vy * t)
+        px = ex + target.vx * t
+        py = ey + target.vy * t
+
+        # Orbit at standoff distance — each ship approaches from its own direction
+        # so ships spread naturally around the target instead of all piling on one point.
+        STANDOFF = self.attack_range * 0.65
+        dx, dy = cx - px, cy - py
+        dd = math.hypot(dx, dy)
+        if dd > 1.0:
+            nx, ny = dx / dd, dy / dd
+            return (px + nx * STANDOFF, py + ny * STANDOFF)
+        return (px, py)
 
     def _calc_flank_pos(self, cx: float, cy: float, target) -> tuple[float, float]:
         """Return a position perpendicular to the target's movement direction."""
@@ -2461,6 +2450,24 @@ class AICharacter(Entity):
             pygame.draw.rect(surface, (120, 0,   0), (bar_x, bar_y, bar_w,  bar_h))
             pygame.draw.rect(surface, (0,   210, 60), (bar_x, bar_y, fill_w, bar_h))
             pygame.draw.rect(surface, (200, 200, 200), (bar_x, bar_y, bar_w, bar_h), 1)
+
+
+# ── Frigate ───────────────────────────────────────────────────────────────────
+
+class Frigate(AICharacter):
+    """Agile, lightly-armoured warship: forward guns + one centre turret."""
+
+    def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
+        super().__init__(wx, wy, waypoints, team, _w=48, _h=24)
+
+
+# ── MediumShip ────────────────────────────────────────────────────────────────
+
+class MediumShip(AICharacter):
+    """Slow, heavily-armoured capital ship with multiple rotating turrets."""
+
+    def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
+        super().__init__(wx, wy, waypoints, team, _w=87, _h=42)
 
 
 # ── Fighter ───────────────────────────────────────────────────────────────────

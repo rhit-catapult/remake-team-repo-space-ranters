@@ -34,7 +34,8 @@ import random
 import threading
 import pygame
 from camera import Camera
-from entities import (AICharacter, Laser, Explosion, Fighter, Carrier, Destroyer,
+from entities import (AICharacter, Frigate, MediumShip, Laser, Explosion,
+                      Fighter, Carrier, Destroyer,
                       Star, Planet, Constructor, DysonSphere, DysonNode,
                       GlowingAsteroid, MineableAsteroid, MinerShip, CargoShip)
 from command_center import CommandCenter
@@ -109,20 +110,22 @@ STARTING_MATERIALS = {
 }
 
 SHIP_COSTS = {
-    'MinerShip':   {'iron': 10, 'nickel': 5},
-    'CargoShip':   {'iron': 15, 'copper': 8},
-    'AICharacter': {'iron': 30, 'copper': 12, 'silicon': 8},
-    'Destroyer':   {'iron': 50, 'copper': 20, 'titanium': 15, 'fuel': 20},
-    'Carrier':     {'iron': 80, 'copper': 30, 'titanium': 35,
-                    'platinum': 10, 'crystal': 15, 'fuel': 45},
+    'MinerShip':  {'iron': 10, 'nickel': 5},
+    'CargoShip':  {'iron': 15, 'copper': 8},
+    'Frigate':    {'iron': 25, 'copper': 10, 'silicon': 6},
+    'MediumShip': {'iron': 45, 'copper': 20, 'silicon': 12},
+    'Destroyer':  {'iron': 50, 'copper': 20, 'titanium': 15, 'fuel': 20},
+    'Carrier':    {'iron': 80, 'copper': 30, 'titanium': 35,
+                   'platinum': 10, 'crystal': 15, 'fuel': 45},
 }
 
 _BUILD_MENU_ROWS = [
-    ('MinerShip',   'Miner',     SHIP_COSTS['MinerShip']),
-    ('CargoShip',   'Cargo',     SHIP_COSTS['CargoShip']),
-    ('AICharacter', 'Frigate',   SHIP_COSTS['AICharacter']),
-    ('Destroyer',   'Destroyer', SHIP_COSTS['Destroyer']),
-    ('Carrier',     'Carrier',   SHIP_COSTS['Carrier']),
+    ('MinerShip',  'Miner',      SHIP_COSTS['MinerShip']),
+    ('CargoShip',  'Cargo',      SHIP_COSTS['CargoShip']),
+    ('Frigate',    'Frigate',    SHIP_COSTS['Frigate']),
+    ('MediumShip', 'Med. Ship',  SHIP_COSTS['MediumShip']),
+    ('Destroyer',  'Destroyer',  SHIP_COSTS['Destroyer']),
+    ('Carrier',    'Carrier',    SHIP_COSTS['Carrier']),
 ]
 
 # ── Cached fonts (initialised on first use after pygame.font.init) ────────────
@@ -588,8 +591,8 @@ _ASTEROID_GLOW_NTH =  25   # every Nth rock is a live glowing entity; rest baked
 
 _ASTEROID_MINEABLE_N = 12   # number of large interactable asteroid entities
 
-_SHIP_SEP_DIST  = 180.0   # world units — all ships push apart when closer than this
-_SHIP_SEP_FORCE = 150.0   # separation push strength (applied as position nudge for eco ships, velocity for combat)
+_SHIP_SEP_DIST  = 210.0   # world units — all ships push apart when closer than this
+_SHIP_SEP_FORCE = 300.0   # separation push strength (applied as position nudge for eco ships, velocity for combat)
 
 # Respawn: when alive counts fall below these, new asteroids are spawned
 _RESPAWN_MIN_ORE   = 4   # minimum live MineableAsteroids before new ones appear
@@ -1216,9 +1219,36 @@ def _spawn_base_explosion(cx: float, cy: float, radius: float,
 
 # ── Resource / build helpers ──────────────────────────────────────────────────
 
-def _ai_assign_miners(team, miners, asteroids, planets_by_team):
-    """Send idle miners to best targets: richest asteroids first, then home planets.
-    Spreads miners across targets instead of piling onto one."""
+def _safe_asteroids(asteroids, all_ships, enemy_team, miner_wx, miner_wy,
+                    near_count=4, enemy_radius=600.0):
+    """Return up to near_count of the closest asteroids that have resources
+    and are not currently patrolled by enemy combat ships."""
+    enemy_positions = [
+        (s.wx + s.width / 2, s.wy + s.height / 2)
+        for s in all_ships
+        if s.team == enemy_team and s.alive and isinstance(s, AICharacter)
+    ]
+    mcx = miner_wx
+    mcy = miner_wy
+
+    def _enemy_nearby(ast):
+        acx = ast.wx + ast.radius
+        acy = ast.wy + ast.radius
+        return any(math.hypot(ex - acx, ey - acy) < enemy_radius
+                   for ex, ey in enemy_positions)
+
+    candidates = [
+        a for a in asteroids
+        if getattr(a, 'resources', 0) > 30 and not _enemy_nearby(a)
+    ]
+    candidates.sort(key=lambda a: math.hypot(
+        (a.wx + a.radius) - mcx, (a.wy + a.radius) - mcy))
+    return candidates[:near_count]
+
+
+def _ai_assign_miners(team, miners, asteroids, planets_by_team, all_ships=None):
+    """Send idle miners to nearby safe asteroids (random pick from closest),
+    falling back to own planets. Spreads miners across targets."""
     idle = [m for m in miners if m.team == team and m.alive and m.state == 'idle']
     if not idle:
         return
@@ -1231,19 +1261,22 @@ def _ai_assign_miners(team, miners, asteroids, planets_by_team):
             if tgt is not None:
                 load[id(tgt)] = load.get(id(tgt), 0) + 1
 
-    rich_asts  = sorted(
-        [a for a in asteroids if hasattr(a, 'resources') and a.resources > 30],
-        key=lambda a: a.resources, reverse=True,
-    )
+    enemy_team  = 1 - team
     own_planets = list(planets_by_team.get(team, []))
-    candidates  = rich_asts + own_planets
-    if not candidates:
-        return
 
     for m in idle:
-        best = min(candidates, key=lambda t: load.get(id(t), 0))
-        m.send_to(best)
-        load[id(best)] = load.get(id(best), 0) + 1
+        mcx = m.wx + m.width  / 2
+        mcy = m.wy + m.height / 2
+        nearby_asts = _safe_asteroids(
+            asteroids, all_ships or [], enemy_team, mcx, mcy)
+        if nearby_asts:
+            target = random.choice(nearby_asts)
+        elif own_planets:
+            target = min(own_planets, key=lambda t: load.get(id(t), 0))
+        else:
+            continue
+        m.send_to(target)
+        load[id(target)] = load.get(id(target), 0) + 1
 
 
 def _ai_queue_build(team, constructors_by_team, miners, cargo_ships,
@@ -1295,8 +1328,11 @@ def _ai_queue_build(team, constructors_by_team, miners, cargo_ships,
     if titanium >= 15 and copper >= 25 and can_afford_safely('Destroyer'):
         build('Destroyer'); return
 
-    if copper >= 15 and can_afford('AICharacter'):
-        build('AICharacter'); return
+    if copper >= 20 and can_afford('MediumShip'):
+        build('MediumShip'); return
+
+    if copper >= 10 and can_afford('Frigate'):
+        build('Frigate'); return
 
     # ── Phase 3: reinvest in economy when combat ships aren't yet affordable ──
     if iron >= 60 and own_miners < 5 and can_afford('MinerShip'):
@@ -1340,7 +1376,7 @@ def _get_constructor_at_screen(solar_entities, camera, sx, sy):
 
 
 _QUEUE_DISPLAY_NAMES = {
-    'AICharacter': 'Frigate', 'MinerShip': 'Miner',
+    'Frigate': 'Frigate', 'MediumShip': 'Med. Ship', 'MinerShip': 'Miner',
     'CargoShip': 'Cargo', 'Destroyer': 'Destroyer', 'Carrier': 'Carrier',
 }
 
@@ -1596,10 +1632,14 @@ def main():
     # HUD visibility (status panel, minimap, banner, control hints, and the
     # planet orbit guide-lines) — toggled with Tab for a clean battle view.
     hud_visible = True
-    
+
     # Game end state — triggered when a command center is destroyed
     game_over = False
     victory = False  # True if player won, False if player lost
+
+    # Auto-pan: when a command center is critical/destroyed, move the camera there.
+    # Set to (world_x, world_y) center of the CC to follow; None = no auto-pan.
+    _cc_danger_pan: tuple | None = None
 
     def render_frame():
         screen_w, screen_h = screen.get_size()
@@ -1882,6 +1922,7 @@ def main():
                         ddx = drag_orig[0] - event.pos[0]
                         ddy = drag_orig[1] - event.pos[1]
                         camera.move(ddx / camera.zoom, ddy / camera.zoom)
+                        _cc_danger_pan = None   # player took manual control
                     drag_orig = event.pos
 
             if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
@@ -2133,8 +2174,10 @@ def main():
                     ship = Carrier(sx, sy, wp, team=team)
                 elif build_type == 'Destroyer':
                     ship = Destroyer(sx, sy, wp, team=team)
+                elif build_type == 'MediumShip':
+                    ship = MediumShip(sx, sy, wp, team=team)
                 else:
-                    ship = AICharacter(sx, sy, wp, team=team)
+                    ship = Frigate(sx, sy, wp, team=team)
                 ship.wx -= ship.width / 2
                 ship.wy -= ship.height / 2
                 ship.deployed = False
@@ -2245,9 +2288,15 @@ def main():
                 if not tgt.alive:
                     finished = True
                 else:
-                    ox, oy = order['offset']
-                    ref._movement_override = (tgt.wx + tgt.width  / 2 + ox,
-                                               tgt.wy + tgt.height / 2 + oy)
+                    no_target = (ref._current_target is None
+                                 or not getattr(ref._current_target, 'alive', False))
+                    if no_target and ref.combat_state != 'retreat':
+                        # Return to formation when not in combat and not retreating;
+                        # during a fight the combat AI chases the enemy, after the
+                        # fight the ship flies back here automatically.
+                        ox, oy = order['offset']
+                        ref._movement_override = (tgt.wx + tgt.width  / 2 + ox,
+                                                   tgt.wy + tgt.height / 2 + oy)
 
             elif order['type'] == 'guard_planet':
                 planet = order['planet']
@@ -2255,8 +2304,10 @@ def main():
                     finished = True
                 else:
                     order['_orbit_angle'] = order.get('_orbit_angle', 0.0) + 0.28 * dt
-                    if ref._current_target is None or not getattr(ref._current_target, 'alive', False):
-                        # Orbit the planet when not in combat
+                    no_target = (ref._current_target is None
+                                 or not getattr(ref._current_target, 'alive', False))
+                    if no_target and ref.combat_state != 'retreat':
+                        # Return to orbit when not in combat and not retreating
                         pcx = planet.wx + planet.radius
                         pcy = planet.wy + planet.radius
                         guard_r = planet.radius + 400.0
@@ -2264,7 +2315,7 @@ def main():
                             pcx + math.cos(order['_orbit_angle']) * guard_r,
                             pcy + math.sin(order['_orbit_angle']) * guard_r,
                         )
-                    # else: combat AI is handling movement — don't override it
+                    # else: combat AI or retreat logic is handling movement
 
             elif order['type'] == 'escort':
                 tgt = order['target']
@@ -2273,10 +2324,13 @@ def main():
                         ref.fleet_leader = None
                     finished = True
                 else:
-                    # Bind fleet_leader so combat AI's fleet-cohesion follows the cargo ship
-                    ref.fleet_leader  = tgt
-                    ref.fleet_offset  = order['offset']
                     tgt._needs_defense = True
+                    if ref.combat_state != 'retreat':
+                        # Bind fleet_leader so combat AI's fleet-cohesion follows the escorted ship;
+                        # skip during retreat so the ship can actually flee instead of being
+                        # pulled back into danger by fleet cohesion.
+                        ref.fleet_leader  = tgt
+                        ref.fleet_offset  = order['offset']
 
             if finished:
                 queue.pop(0)
@@ -2355,13 +2409,9 @@ def main():
             ai_build_timer = 6.0
             _ai_queue_build(enemy_team, constructors_by_team, miners, cargo_ships,
                             team_materials)
-            # Assign any AI miners that are still idle (planets + asteroids)
-            _ai_targets = planets_by_team.get(enemy_team, []) + [
-                a for a in asteroids if hasattr(a, 'planet_type')]
-            if _ai_targets:
-                for _m in miners:
-                    if _m.team == enemy_team and _m.alive and _m.state == 'idle':
-                        _m.send_to(random.choice(_ai_targets))
+            # Assign any AI miners that are still idle
+            _ai_assign_miners(enemy_team, miners, asteroids,
+                              planets_by_team, all_ships=ai_characters)
 
         # Asteroid field tick
         for asteroid in asteroids:
@@ -2389,13 +2439,15 @@ def main():
                 asteroids.append(GlowingAsteroid(gx, gy))
 
         # Re-assign player miners that went idle because their asteroid depleted.
-        # Once a miner is in asteroid_mode it should keep mining like a planet miner would.
-        _avail_asteroids = [a for a in asteroids if getattr(a, 'resources', 1) > 0]
-        if _avail_asteroids:
-            for _m in miners:
-                if (_m.team == player_team and _m.alive
-                        and _m.state == 'idle' and _m._asteroid_mode):
-                    _m.send_to(random.choice(_avail_asteroids))
+        for _m in miners:
+            if (_m.team == player_team and _m.alive
+                    and _m.state == 'idle' and _m._asteroid_mode):
+                _mcx = _m.wx + _m.width  / 2
+                _mcy = _m.wy + _m.height / 2
+                _nearby = _safe_asteroids(
+                    asteroids, ai_characters, enemy_team, _mcx, _mcy)
+                if _nearby:
+                    _m.send_to(random.choice(_nearby))
 
         # Laser and explosion ticks
         for laser in lasers:
@@ -2412,6 +2464,22 @@ def main():
             if cmd_marker_t <= 0:
                 cmd_markers.clear()
 
+        # ── Auto-pan: follow a command center when it's critical or destroyed ───
+        _CC_DANGER_FRAC = 0.25   # 25% HP triggers the pan
+        if not game_over:
+            _pt = 1 - player_team
+            _pcc = command_centers_by_team.get(player_team)
+            _ecc = command_centers_by_team.get(_pt)
+            # Player's own base in danger takes priority over enemy base
+            if _pcc and _pcc.alive and _pcc.hp / _pcc.max_hp <= _CC_DANGER_FRAC:
+                _cc_danger_pan = (_pcc.wx + _pcc.radius, _pcc.wy + _pcc.radius)
+            elif _ecc and _ecc.alive and _ecc.hp / _ecc.max_hp <= _CC_DANGER_FRAC:
+                _cc_danger_pan = (_ecc.wx + _ecc.radius, _ecc.wy + _ecc.radius)
+
+        if _cc_danger_pan is not None:
+            _pan_lerp = min(1.0, (2.5 if game_over else 1.2) * dt)
+            camera.follow(_cc_danger_pan[0], _cc_danger_pan[1], lerp=_pan_lerp)
+
         camera.clamp(WORLD_W, WORLD_H)
 
         # ── Win/Lose Condition Check ─────────────────────────────────────────
@@ -2424,6 +2492,8 @@ def main():
             if player_cc and not player_cc.alive:
                 game_over = True
                 victory = False
+                _cc_danger_pan = (player_cc.wx + player_cc.radius,
+                                  player_cc.wy + player_cc.radius)
                 _spawn_base_explosion(
                     player_cc.wx + player_cc.radius,
                     player_cc.wy + player_cc.radius,
@@ -2432,6 +2502,8 @@ def main():
             elif enemy_cc and not enemy_cc.alive:
                 game_over = True
                 victory = True
+                _cc_danger_pan = (enemy_cc.wx + enemy_cc.radius,
+                                  enemy_cc.wy + enemy_cc.radius)
                 _spawn_base_explosion(
                     enemy_cc.wx + enemy_cc.radius,
                     enemy_cc.wy + enemy_cc.radius,
