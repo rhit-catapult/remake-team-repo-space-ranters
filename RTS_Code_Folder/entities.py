@@ -107,9 +107,14 @@ class Planet(Entity):
         super().__init__(star_x + math.cos(angle) * orbit_radius - radius,
                          star_y + math.sin(angle) * orbit_radius - radius,
                          radius * 2, radius * 2, color)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(1.5, 3.5), 1) for m in _chosen}
+        # Set yields based on planet type (from MinerShip._PLANET_YIELDS)
+        yields_map = {
+            'home':  {'iron': 2.0, 'nickel': 1.5},
+            'rocky': {'iron': 5.0, 'nickel': 3.0, 'copper': 2.0},
+            'water': {'ice': 3.0, 'silicon': 2.5},
+            'gas':   {'helium3': 2.0, 'fuel': 3.5},
+        }
+        self.yields = yields_map.get(planet_type, {})
 
     def update(self, dt: float):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
@@ -559,15 +564,15 @@ class MinerShip(Entity):
 
     # Infinite-resource planet yields  {ptype: {material: rate/s}}
     _PLANET_YIELDS = {
-        'home':  {'iron': 2.0, 'silicon': 2.0, 'copper': 1.0},
-        'rocky': {'iron': 4.0, 'nickel':  2.0},
-        'water': {'copper': 3.0, 'ice': 2.5},
-        'gas':   {'fuel': 3.5, 'helium3': 2.0},
+        'home':  {'iron': 2.0, 'nickel': 1.5},
+        'rocky': {'iron': 5.0, 'nickel': 3.0, 'copper': 2.0},
+        'water': {'ice': 3.0, 'silicon': 2.5},
+        'gas':   {'helium3': 2.0, 'fuel': 3.5},
     }
     # Finite asteroid yields  {ptype: {material: rate/s}}  — rates sum to total depletion rate
     _ASTEROID_YIELDS = {
-        'asteroid': {'titanium': 8.0, 'platinum': 4.0},
-        'glowing':  {'crystal':  5.0, 'uranium':  3.0},
+        'asteroid': {'titanium': 8.0, 'uranium': 4.0},
+        'glowing':  {'crystal': 5.0, 'platinum': 3.0},
     }
 
     def __init__(self, wx: float, wy: float, team: int, planets: list):
@@ -1320,9 +1325,8 @@ class GlowingAsteroid:
         self.glow_color  = random.choice(self._GLOW_PALETTE)
         self._rock_color = (168, 162, 155)
         self._rock_rim   = (210, 205, 200)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(10.0, 20.0), 1) for m in _chosen}
+        # Set yields based on asteroid type (glowing asteroids)
+        self.yields = {'crystal': 5.0, 'platinum': 3.0}
 
     def update(self, dt: float) -> None:
         self.time += dt
@@ -1417,9 +1421,8 @@ class MineableAsteroid:
 
         self._col_fill = (138, 132, 124)
         self._col_rim  = (195, 190, 185)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(8.0, 15.0), 1) for m in _chosen}
+        # Set yields based on asteroid type (mineable/normal asteroids)
+        self.yields = {'titanium': 8.0, 'uranium': 4.0}
 
     def update(self, dt: float) -> None:
         pass

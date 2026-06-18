@@ -70,12 +70,12 @@ TEAM_NAMES = ["BLUE COMMAND", "RED COMMAND"]
 
 # ── Resource / build system ───────────────────────────────────────────────────
 # Planet  → material mapping (see MinerShip._PLANET_YIELDS / _ASTEROID_YIELDS)
-# home    → Iron + Silicon + Copper
-# rocky   → Iron + Nickel
-# water   → Copper + Ice
-# gas     → Fuel + Helium-3
-# asteroid→ Titanium + Platinum  (finite, high rate)
-# glowing → Crystal  + Uranium   (finite, high rate)
+# home    → Iron + Nickel
+# rocky   → Iron + Nickel + Copper (higher yield)
+# water   → Ice + Silicon
+# gas     → Helium-3 + Fuel
+# asteroid→ Titanium + Uranium
+# glowing → Crystal + Platinum
 
 ALL_MATERIALS = [
     'iron', 'nickel', 'copper', 'silicon', 'ice',
