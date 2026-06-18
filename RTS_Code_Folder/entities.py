@@ -11,6 +11,10 @@ _ALL_MATERIALS = [
     'helium3', 'fuel', 'titanium', 'platinum', 'crystal', 'uranium',
 ]
 
+_GAS_MATERIALS          = {'helium3', 'fuel'}
+_SOLID_LIQUID_MATERIALS = {'iron', 'nickel', 'copper', 'silicon', 'ice',
+                            'titanium', 'platinum', 'crystal', 'uranium'}
+
 
 class Entity:
     """Base class. Lives in world space; knows nothing about the screen."""
@@ -107,9 +111,46 @@ class Planet(Entity):
         super().__init__(star_x + math.cos(angle) * orbit_radius - radius,
                          star_y + math.sin(angle) * orbit_radius - radius,
                          radius * 2, radius * 2, color)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(1.5, 3.5), 1) for m in _chosen}
+        # Build type-biased material weights and rate functions.
+        # Any material can appear, but each planet type strongly favours its category.
+        # Planet rates are capped at 5.0 so asteroids (min 8.0) always beat planets in quantity.
+        if planet_type == 'gas':
+            # Highest gas concentration of any source; other materials rarely present.
+            _weights = [9 if m in _GAS_MATERIALS else 1 for m in _ALL_MATERIALS]
+            def _rate(m):
+                return random.uniform(3.0, 5.0) if m in _GAS_MATERIALS else random.uniform(0.4, 1.5)
+        elif planet_type == 'rocky':
+            _weights = [1 if m in _GAS_MATERIALS else 8 for m in _ALL_MATERIALS]
+            def _rate(m):
+                return random.uniform(0.3, 1.0) if m in _GAS_MATERIALS else random.uniform(2.0, 4.5)
+        elif planet_type == 'water':
+            _water_pref = {'ice', 'copper'}
+            _weights = [8 if m in _water_pref else (1 if m in _GAS_MATERIALS else 3)
+                        for m in _ALL_MATERIALS]
+            def _rate(m):
+                if m in _GAS_MATERIALS: return random.uniform(0.3, 1.0)
+                if m in _water_pref:    return random.uniform(2.5, 4.5)
+                return random.uniform(1.0, 2.5)
+        else:  # home
+            _home_pref = {'iron', 'nickel', 'copper', 'silicon'}
+            _weights = [6 if m in _home_pref else (1 if m in _GAS_MATERIALS else 2)
+                        for m in _ALL_MATERIALS]
+            def _rate(m):
+                if m in _GAS_MATERIALS: return random.uniform(0.5, 1.5)
+                if m in _home_pref:     return random.uniform(1.5, 3.5)
+                return random.uniform(0.8, 2.0)
+
+        # Weighted sample without replacement
+        _pool = list(zip(_ALL_MATERIALS, _weights))
+        _chosen = []
+        for _ in range(random.randint(2, 4)):
+            if not _pool:
+                break
+            _ms, _ws = zip(*_pool)
+            _pick = random.choices(_ms, weights=_ws, k=1)[0]
+            _chosen.append(_pick)
+            _pool = [(m, w) for m, w in _pool if m != _pick]
+        self.yields = {m: round(_rate(m), 1) for m in _chosen}
 
     def update(self, dt: float):
         self.angle = (self.angle + self.orbit_speed * dt) % math.tau
