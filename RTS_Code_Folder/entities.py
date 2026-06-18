@@ -600,15 +600,15 @@ class MinerShip(Entity):
 
     # Infinite-resource planet yields  {ptype: {material: rate/s}}
     _PLANET_YIELDS = {
-        'home':  {'iron': 2.0, 'silicon': 2.0, 'copper': 1.0},
-        'rocky': {'iron': 4.0, 'nickel':  2.0},
-        'water': {'copper': 3.0, 'ice': 2.5},
-        'gas':   {'fuel': 3.5, 'helium3': 2.0},
+        'home':  {'iron': 2.0, 'nickel': 1.5},
+        'rocky': {'iron': 5.0, 'nickel': 3.0, 'copper': 2.0},
+        'water': {'ice': 3.0, 'silicon': 2.5},
+        'gas':   {'helium3': 2.0, 'fuel': 3.5},
     }
     # Finite asteroid yields  {ptype: {material: rate/s}}  — rates sum to total depletion rate
     _ASTEROID_YIELDS = {
-        'asteroid': {'titanium': 8.0, 'platinum': 4.0},
-        'glowing':  {'crystal':  5.0, 'uranium':  3.0},
+        'asteroid': {'titanium': 8.0, 'uranium': 4.0},
+        'glowing':  {'crystal': 5.0, 'platinum': 3.0},
     }
 
     def __init__(self, wx: float, wy: float, team: int, planets: list):
@@ -1361,9 +1361,8 @@ class GlowingAsteroid:
         self.glow_color  = random.choice(self._GLOW_PALETTE)
         self._rock_color = (168, 162, 155)
         self._rock_rim   = (210, 205, 200)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(10.0, 20.0), 1) for m in _chosen}
+        # Set yields based on asteroid type (glowing asteroids)
+        self.yields = {'crystal': 5.0, 'platinum': 3.0}
 
     def update(self, dt: float) -> None:
         self.time += dt
@@ -1458,9 +1457,8 @@ class MineableAsteroid:
 
         self._col_fill = (138, 132, 124)
         self._col_rim  = (195, 190, 185)
-        _n = random.randint(2, 3)
-        _chosen = random.sample(_ALL_MATERIALS, _n)
-        self.yields = {m: round(random.uniform(8.0, 15.0), 1) for m in _chosen}
+        # Set yields based on asteroid type (mineable/normal asteroids)
+        self.yields = {'titanium': 8.0, 'uranium': 4.0}
 
     def update(self, dt: float) -> None:
         pass
@@ -1730,11 +1728,11 @@ class AICharacter(Entity):
         else:
             big = random.random() > 0.5
             if big:
-                w = random.randint(66, 108)
-                h = random.randint(30, 54)
+                w = 87
+                h = 42
             else:
-                w = random.randint(36, 60)
-                h = random.randint(18, 30)
+                w = 48
+                h = 24
 
         color = random.choice(_TEAM_COLORS[team])
         super().__init__(wx, wy, w, h, color)
@@ -2483,8 +2481,8 @@ class Fighter(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int, home_carrier=None):
-        w = random.randint(15, 22)
-        h = random.randint(7, 12)
+        w = 18
+        h = 10
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override all stats — fighters are extreme in every direction
@@ -2690,8 +2688,8 @@ class Carrier(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int):
-        w = random.randint(240, 300)
-        h = random.randint(97, 127)
+        w = 270
+        h = 112
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override stats: slow, tanky, light AA armament
@@ -2973,8 +2971,8 @@ class Destroyer(AICharacter):
     CANNON_DAMAGE = 200         # one-shots any capital ship
 
     def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
-        w = random.randint(97, 123)
-        h = random.randint(33, 46)
+        w = 110
+        h = 40
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         self.max_speed  = random.uniform(220, 310)
