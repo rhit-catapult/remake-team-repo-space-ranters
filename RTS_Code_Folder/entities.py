@@ -1692,11 +1692,11 @@ class AICharacter(Entity):
         else:
             big = random.random() > 0.5
             if big:
-                w = random.randint(66, 108)
-                h = random.randint(30, 54)
+                w = 87
+                h = 42
             else:
-                w = random.randint(36, 60)
-                h = random.randint(18, 30)
+                w = 48
+                h = 24
 
         color = random.choice(_TEAM_COLORS[team])
         super().__init__(wx, wy, w, h, color)
@@ -2445,8 +2445,8 @@ class Fighter(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int, home_carrier=None):
-        w = random.randint(15, 22)
-        h = random.randint(7, 12)
+        w = 18
+        h = 10
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override all stats — fighters are extreme in every direction
@@ -2652,8 +2652,8 @@ class Carrier(AICharacter):
 
     def __init__(self, wx: float, wy: float, waypoints: list[tuple[float, float]],
                  team: int):
-        w = random.randint(240, 300)
-        h = random.randint(97, 127)
+        w = 270
+        h = 112
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         # Override stats: slow, tanky, light AA armament
@@ -2935,8 +2935,8 @@ class Destroyer(AICharacter):
     CANNON_DAMAGE = 200         # one-shots any capital ship
 
     def __init__(self, wx: float, wy: float, waypoints: list, team: int = 0):
-        w = random.randint(97, 123)
-        h = random.randint(33, 46)
+        w = 110
+        h = 40
         super().__init__(wx, wy, waypoints, team, _w=w, _h=h)
 
         self.max_speed  = random.uniform(220, 310)
